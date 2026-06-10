@@ -37,4 +37,7 @@ go.work.sum
 
 dist/
 
-killswitch
+/killswitch
+/killswitch-user
+/killswitch-cli
+/killswitch-gui

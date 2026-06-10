@@ -16,10 +16,10 @@ import (
 	"os/signal"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 
+	"github.com/asciimoth/killswitch/internal/policy"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
@@ -32,8 +32,8 @@ const (
 	bootstrapDHCPv6 = 3
 	bootstrapICMPv6 = 4
 
-	ipProtoTCP = 6
-	ipProtoUDP = 17
+	ipProtoTCP = policy.IPProtoTCP
+	ipProtoUDP = policy.IPProtoUDP
 )
 
 // runtimeConfig mirrors struct runtime_config in killswitch.c. Keep this type
@@ -179,22 +179,22 @@ func parseFlags(args []string) (options, error) {
 		}
 	}
 	var err error
-	if opts.AllowedMarks, err = parseAllowedMarks(allowMarks); err != nil {
+	if opts.AllowedMarks, err = policy.ParseAllowedMarks(allowMarks); err != nil {
 		return options{}, err
 	}
-	if opts.AllowedPorts, err = parseAllowedPorts(allowPorts); err != nil {
+	if opts.AllowedPorts, err = allowedPortKeys(allowPorts); err != nil {
 		return options{}, err
 	}
-	if opts.AllowedV4Hosts, err = parseAllowedV4Hosts(allowV4Hosts); err != nil {
+	if opts.AllowedV4Hosts, err = allowedV4HostKeys(allowV4Hosts); err != nil {
 		return options{}, err
 	}
-	if opts.AllowedV6Hosts, err = parseAllowedV6Hosts(allowV6Hosts); err != nil {
+	if opts.AllowedV6Hosts, err = allowedV6HostKeys(allowV6Hosts); err != nil {
 		return options{}, err
 	}
-	if opts.AllowedV4Pairs, err = parseAllowedV4Hostports(allowV4Hostports); err != nil {
+	if opts.AllowedV4Pairs, err = allowedV4HostportKeys(allowV4Hostports); err != nil {
 		return options{}, err
 	}
-	if opts.AllowedV6Pairs, err = parseAllowedV6Hostports(allowV6Hostports); err != nil {
+	if opts.AllowedV6Pairs, err = allowedV6HostportKeys(allowV6Hostports); err != nil {
 		return options{}, err
 	}
 
@@ -377,158 +377,72 @@ func attachEgress(program *ebpf.Program, ifaces []net.Interface) ([]link.Link, e
 	return links, nil
 }
 
-func parseAllowedMarks(values []string) ([]uint32, error) {
-	out := make([]uint32, 0, len(values))
-	for _, value := range values {
-		parsed, err := strconv.ParseUint(value, 0, 32)
-		if err != nil {
-			return nil, fmt.Errorf("parse -allow-mark %q: %w", value, err)
-		}
-		out = append(out, uint32(parsed))
+func allowedPortKeys(values []string) ([]portKey, error) {
+	rules, err := policy.ParseAllowedPorts(values)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	keys := make([]portKey, 0, len(rules))
+	for _, rule := range rules {
+		keys = append(keys, portKey{Dport: htons(rule.Port), Protocol: rule.Protocol})
+	}
+	return keys, nil
 }
 
-func parseAllowedPorts(values []string) ([]portKey, error) {
-	out := make([]portKey, 0, len(values))
-	for _, value := range values {
-		protocol, port, err := parseProtocolPort(value)
-		if err != nil {
-			return nil, fmt.Errorf("parse -allow-port %q: %w", value, err)
-		}
-		out = append(out, portKey{Dport: htons(port), Protocol: protocol})
+func allowedV4HostKeys(values []string) ([]uint32, error) {
+	addrs, err := policy.ParseAllowedV4Hosts(values)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	keys := make([]uint32, 0, len(addrs))
+	for _, addr := range addrs {
+		keys = append(keys, ipv4Key(addr))
+	}
+	return keys, nil
 }
 
-func parseAllowedV4Hosts(values []string) ([]uint32, error) {
-	out := make([]uint32, 0, len(values))
-	for _, value := range values {
-		addr, err := parseAddr(value)
-		if err != nil {
-			return nil, fmt.Errorf("parse -allow-v4-host %q: %w", value, err)
-		}
-		if !addr.Is4() {
-			return nil, fmt.Errorf("parse -allow-v4-host %q: address is not IPv4", value)
-		}
-		out = append(out, ipv4Key(addr))
+func allowedV6HostKeys(values []string) ([]ipv6AddrKey, error) {
+	addrs, err := policy.ParseAllowedV6Hosts(values)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	keys := make([]ipv6AddrKey, 0, len(addrs))
+	for _, addr := range addrs {
+		keys = append(keys, ipv6Key(addr))
+	}
+	return keys, nil
 }
 
-func parseAllowedV6Hosts(values []string) ([]ipv6AddrKey, error) {
-	out := make([]ipv6AddrKey, 0, len(values))
-	for _, value := range values {
-		addr, err := parseAddr(value)
-		if err != nil {
-			return nil, fmt.Errorf("parse -allow-v6-host %q: %w", value, err)
-		}
-		if !addr.Is6() || addr.Is4In6() {
-			return nil, fmt.Errorf("parse -allow-v6-host %q: address is not IPv6", value)
-		}
-		out = append(out, ipv6Key(addr))
+func allowedV4HostportKeys(values []string) ([]hostport4Key, error) {
+	rules, err := policy.ParseAllowedV4Hostports(values)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
-}
-
-func parseAllowedV4Hostports(values []string) ([]hostport4Key, error) {
-	out := make([]hostport4Key, 0, len(values))
-	for _, value := range values {
-		protocol, addrPort, err := parseProtocolAddrPort(value)
-		if err != nil {
-			return nil, fmt.Errorf("parse -allow-v4-hostport %q: %w", value, err)
-		}
-		if !addrPort.Addr().Is4() {
-			return nil, fmt.Errorf("parse -allow-v4-hostport %q: address is not IPv4", value)
-		}
-		out = append(out, hostport4Key{
-			Daddr:    ipv4Key(addrPort.Addr()),
-			Dport:    htons(addrPort.Port()),
-			Protocol: protocol,
+	keys := make([]hostport4Key, 0, len(rules))
+	for _, rule := range rules {
+		keys = append(keys, hostport4Key{
+			Daddr:    ipv4Key(rule.AddrPort.Addr()),
+			Dport:    htons(rule.AddrPort.Port()),
+			Protocol: rule.Protocol,
 		})
 	}
-	return out, nil
+	return keys, nil
 }
 
-func parseAllowedV6Hostports(values []string) ([]hostport6Key, error) {
-	out := make([]hostport6Key, 0, len(values))
-	for _, value := range values {
-		protocol, addrPort, err := parseProtocolAddrPort(value)
-		if err != nil {
-			return nil, fmt.Errorf("parse -allow-v6-hostport %q: %w", value, err)
-		}
-		if !addrPort.Addr().Is6() || addrPort.Addr().Is4In6() {
-			return nil, fmt.Errorf("parse -allow-v6-hostport %q: address is not IPv6", value)
-		}
-		out = append(out, hostport6Key{
-			Daddr:    ipv6Key(addrPort.Addr()).Addr,
-			Dport:    htons(addrPort.Port()),
-			Protocol: protocol,
+func allowedV6HostportKeys(values []string) ([]hostport6Key, error) {
+	rules, err := policy.ParseAllowedV6Hostports(values)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]hostport6Key, 0, len(rules))
+	for _, rule := range rules {
+		keys = append(keys, hostport6Key{
+			Daddr:    ipv6Key(rule.AddrPort.Addr()).Addr,
+			Dport:    htons(rule.AddrPort.Port()),
+			Protocol: rule.Protocol,
 		})
 	}
-	return out, nil
-}
-
-func parseProtocolPort(value string) (uint8, uint16, error) {
-	protocolText, portText, ok := strings.Cut(value, "/")
-	if !ok {
-		return 0, 0, errors.New("expected protocol/port")
-	}
-	protocol, err := parseProtocol(protocolText)
-	if err != nil {
-		return 0, 0, err
-	}
-	port, err := parsePort(portText)
-	if err != nil {
-		return 0, 0, err
-	}
-	return protocol, port, nil
-}
-
-func parseProtocolAddrPort(value string) (uint8, netip.AddrPort, error) {
-	protocolText, addrPortText, ok := strings.Cut(value, "/")
-	if !ok {
-		return 0, netip.AddrPort{}, errors.New("expected protocol/address:port")
-	}
-	protocol, err := parseProtocol(protocolText)
-	if err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-	addrPort, err := netip.ParseAddrPort(addrPortText)
-	if err != nil {
-		return 0, netip.AddrPort{}, err
-	}
-	return protocol, addrPort, nil
-}
-
-func parseProtocol(value string) (uint8, error) {
-	switch strings.ToLower(value) {
-	case "tcp":
-		return ipProtoTCP, nil
-	case "udp":
-		return ipProtoUDP, nil
-	default:
-		return 0, fmt.Errorf("unsupported protocol %q", value)
-	}
-}
-
-func parsePort(value string) (uint16, error) {
-	parsed, err := strconv.ParseUint(value, 10, 16)
-	if err != nil {
-		return 0, err
-	}
-	if parsed == 0 {
-		return 0, errors.New("port must be greater than zero")
-	}
-	return uint16(parsed), nil
-}
-
-func parseAddr(value string) (netip.Addr, error) {
-	addr, err := netip.ParseAddr(value)
-	if err != nil {
-		return netip.Addr{}, err
-	}
-	return addr.Unmap(), nil
+	return keys, nil
 }
 
 func closeLinks(links []link.Link) {
