@@ -6,6 +6,9 @@ import (
 	"net"
 	"strings"
 	"testing"
+
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 func TestConfigRequiresInterfaceSelector(t *testing.T) {
@@ -50,6 +53,7 @@ func TestParseArgs(t *testing.T) {
 
 func TestLoadOptionsFromStdin(t *testing.T) {
 	opts, err := loadOptions("-", strings.NewReader(`{
+		"interface_types": ["device"],
 		"interface_names": ["eth0", "wlan0"],
 		"interface_regexps": ["^en"],
 		"allow_all": true,
@@ -70,6 +74,7 @@ func TestLoadOptionsFromStdin(t *testing.T) {
 
 func TestConfigToOptions(t *testing.T) {
 	opts, err := configToOptions(configFile{
+		InterfaceTypes:   []string{"device"},
 		InterfaceNames:   []string{"eth0", "wlan0"},
 		InterfaceRegexps: []string{"^en"},
 		AllowAll:         true,
@@ -93,6 +98,9 @@ func assertParsedOptions(t *testing.T, opts options) {
 
 	if got := strings.Join(opts.InterfaceNames, ","); got != "eth0,wlan0" {
 		t.Fatalf("interface names = %q", got)
+	}
+	if got := strings.Join(opts.InterfaceTypes, ","); got != "device" {
+		t.Fatalf("interface types = %q", got)
 	}
 	if got := strings.Join(opts.InterfaceRegexps, ","); got != "^en" {
 		t.Fatalf("interface regexps = %q", got)
@@ -138,10 +146,10 @@ func TestParseAllowlistValidation(t *testing.T) {
 }
 
 func TestSelectInterfacesByNameAndRegexp(t *testing.T) {
-	all := []net.Interface{
-		{Name: "lo", Index: 1},
-		{Name: "wlan0", Index: 3},
-		{Name: "eth0", Index: 2},
+	all := []interfaceInfo{
+		{Name: "lo", Index: 1, Type: "device"},
+		{Name: "wlan0", Index: 3, Type: "device"},
+		{Name: "eth0", Index: 2, Type: "device"},
 	}
 	opts := options{
 		InterfaceNames:   []string{"wlan0"},
@@ -155,6 +163,64 @@ func TestSelectInterfacesByNameAndRegexp(t *testing.T) {
 
 	if got := interfaceNames(selected); got != "eth0, wlan0" {
 		t.Fatalf("selected interfaces = %q", got)
+	}
+}
+
+func TestSelectInterfacesByLiteralType(t *testing.T) {
+	all := []interfaceInfo{
+		{Name: "lo", Index: 1, Type: "device"},
+		{Name: "wg0", Index: 2, Type: "wireguard"},
+		{Name: "br0", Index: 3, Type: "bridge"},
+	}
+	opts := options{
+		InterfaceTypes: []string{"bridge"},
+	}
+
+	selected, err := selectInterfaces(all, opts)
+	if err != nil {
+		t.Fatalf("select interfaces: %v", err)
+	}
+
+	if got := interfaceNames(selected); got != "br0" {
+		t.Fatalf("selected interfaces = %q", got)
+	}
+}
+
+func TestShouldReconcileLinkUpdateIgnoresUnchangedSelectedInterface(t *testing.T) {
+	manager := newEgressManager(nil)
+	manager.attached[4] = attachedInterface{info: interfaceInfo{Name: "wlp0s20f3", Index: 4, Type: "device"}}
+
+	if manager.shouldReconcileLinkUpdate(linkUpdate(unix.RTM_NEWLINK, 4, "wlp0s20f3", "device"), options{
+		InterfaceRegexps: []string{"^wl"},
+	}) {
+		t.Fatal("expected unchanged selected interface update to be ignored")
+	}
+}
+
+func TestShouldReconcileLinkUpdateAllowsAttachAndDetachEvents(t *testing.T) {
+	manager := newEgressManager(nil)
+
+	if !manager.shouldReconcileLinkUpdate(linkUpdate(unix.RTM_NEWLINK, 4, "wlp0s20f3", "device"), options{
+		InterfaceRegexps: []string{"^wl"},
+	}) {
+		t.Fatal("expected new matching interface to trigger reconcile")
+	}
+
+	manager.attached[4] = attachedInterface{info: interfaceInfo{Name: "wlp0s20f3", Index: 4, Type: "device"}}
+	if !manager.shouldReconcileLinkUpdate(linkUpdate(unix.RTM_DELLINK, 4, "wlp0s20f3", "device"), options{
+		InterfaceRegexps: []string{"^wl"},
+	}) {
+		t.Fatal("expected deleted attached interface to trigger reconcile")
+	}
+}
+
+func TestShouldReconcileLinkUpdateIgnoresUnselectedInterface(t *testing.T) {
+	manager := newEgressManager(nil)
+
+	if manager.shouldReconcileLinkUpdate(linkUpdate(unix.RTM_NEWLINK, 5, "veth0", "veth"), options{
+		InterfaceRegexps: []string{"^wl"},
+	}) {
+		t.Fatal("expected unselected interface update to be ignored")
 	}
 }
 
@@ -229,4 +295,18 @@ func ipv6Bytes(t *testing.T, value string) [16]byte {
 	var out [16]byte
 	copy(out[:], parsed)
 	return out
+}
+
+func linkUpdate(msgType uint16, index int, name string, typ string) netlink.LinkUpdate {
+	link := &netlink.GenericLink{
+		LinkAttrs: netlink.LinkAttrs{
+			Index: index,
+			Name:  name,
+		},
+		LinkType: typ,
+	}
+	return netlink.LinkUpdate{
+		Header: unix.NlMsghdr{Type: msgType},
+		Link:   link,
+	}
 }

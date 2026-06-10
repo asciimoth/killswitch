@@ -1,4 +1,7 @@
 {
+  "interface_types": [
+    "device"
+  ],
   "interface_names": [
     "eth0",
     "wlan0"

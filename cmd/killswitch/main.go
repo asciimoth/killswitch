@@ -25,6 +25,8 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -100,6 +102,7 @@ type hostport6Key struct {
 }
 
 type options struct {
+	InterfaceTypes   []string
 	InterfaceNames   []string
 	InterfaceRegexps []string
 	AllowAll         bool
@@ -114,6 +117,7 @@ type options struct {
 }
 
 type configFile struct {
+	InterfaceTypes   []string `json:"interface_types"`
 	InterfaceNames   []string `json:"interface_names"`
 	InterfaceRegexps []string `json:"interface_regexps"`
 	AllowAll         bool     `json:"allow_all"`
@@ -125,6 +129,22 @@ type configFile struct {
 	AllowedV6Hosts   []string `json:"allowed_v6_hosts"`
 	AllowedV4Pairs   []string `json:"allowed_v4_hostports"`
 	AllowedV6Pairs   []string `json:"allowed_v6_hostports"`
+}
+
+type interfaceInfo struct {
+	Index int
+	Name  string
+	Type  string
+}
+
+type attachedInterface struct {
+	link link.Link
+	info interfaceInfo
+}
+
+type egressManager struct {
+	program  *ebpf.Program
+	attached map[int]attachedInterface
 }
 
 func main() {
@@ -184,14 +204,15 @@ func loadOptions(configPath string, stdin io.Reader) (options, error) {
 
 func configToOptions(cfg configFile) (options, error) {
 	opts := options{
+		InterfaceTypes:   cfg.InterfaceTypes,
 		InterfaceNames:   cfg.InterfaceNames,
 		InterfaceRegexps: cfg.InterfaceRegexps,
 		AllowAll:         cfg.AllowAll,
 		EnableV4:         cfg.EnableV4,
 		EnableV6:         cfg.EnableV6,
 	}
-	if len(opts.InterfaceNames) == 0 && len(opts.InterfaceRegexps) == 0 {
-		return options{}, errors.New("at least one interface_names or interface_regexps entry is required")
+	if len(opts.InterfaceTypes) == 0 && len(opts.InterfaceNames) == 0 && len(opts.InterfaceRegexps) == 0 {
+		return options{}, errors.New("at least one interface_types, interface_names, or interface_regexps entry is required")
 	}
 
 	for _, pattern := range opts.InterfaceRegexps {
@@ -248,22 +269,10 @@ func run(parent context.Context, opts options) error {
 		return err
 	}
 
-	ifaces, err := selectedInterfaces(opts)
-	if err != nil {
-		return err
-	}
-	if len(ifaces) == 0 {
-		return errors.New("no interfaces matched the configured selectors")
-	}
-
-	links, err := attachEgress(objs.KillswitchEgress, ifaces)
-	if err != nil {
-		return err
-	}
-	defer closeLinks(links)
-
-	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	signalCtx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(signalCtx)
+	defer cancel()
 
 	reader, err := ringbuf.NewReader(objs.BootstrapEvents)
 	if err != nil {
@@ -276,7 +285,6 @@ func run(parent context.Context, opts options) error {
 		_ = reader.Close()
 	}()
 
-	log.Printf("Kill switch attached to: %s", interfaceNames(ifaces))
 	log.Printf("Runtime config: allow_all=%t enable_v4=%t enable_v6=%t", opts.AllowAll, opts.EnableV4, opts.EnableV6)
 	log.Printf("Allowlists: marks=%d ports=%d v4_hosts=%d v6_hosts=%d v4_hostports=%d v6_hostports=%d",
 		len(opts.AllowedMarks),
@@ -287,21 +295,66 @@ func run(parent context.Context, opts options) error {
 		len(opts.AllowedV6Pairs),
 	)
 
-	if err := readBootstrapEvents(reader); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
+	errCh := make(chan error, 2)
+	go func() {
+		if err := readBootstrapEvents(reader); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
+			errCh <- err
+		}
+	}()
+
+	manager := newEgressManager(objs.KillswitchEgress)
+	defer manager.close()
+
+	go func() {
+		if err := watchInterfaces(ctx, manager, opts); err != nil {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errCh:
+		cancel()
 		return err
 	}
-	return nil
 }
 
-func selectedInterfaces(opts options) ([]net.Interface, error) {
-	all, err := net.Interfaces()
+func selectedInterfaces(opts options) ([]interfaceInfo, error) {
+	all, err := listInterfaces()
 	if err != nil {
 		return nil, fmt.Errorf("list interfaces: %w", err)
 	}
 	return selectInterfaces(all, opts)
 }
 
-func selectInterfaces(all []net.Interface, opts options) ([]net.Interface, error) {
+func listInterfaces() ([]interfaceInfo, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil, err
+	}
+
+	all := make([]interfaceInfo, 0, len(links))
+	for _, l := range links {
+		attrs := l.Attrs()
+		if attrs == nil {
+			continue
+		}
+		all = append(all, interfaceInfo{
+			Index: attrs.Index,
+			Name:  attrs.Name,
+			Type:  l.Type(),
+		})
+	}
+	return all, nil
+}
+
+func selectInterfaces(all []interfaceInfo, opts options) ([]interfaceInfo, error) {
+	types := make(map[string]struct{}, len(opts.InterfaceTypes))
+	for _, typ := range opts.InterfaceTypes {
+		types[typ] = struct{}{}
+	}
+
 	names := make(map[string]struct{}, len(opts.InterfaceNames))
 	for _, name := range opts.InterfaceNames {
 		names[name] = struct{}{}
@@ -316,8 +369,12 @@ func selectInterfaces(all []net.Interface, opts options) ([]net.Interface, error
 		regexps = append(regexps, re)
 	}
 
-	var selected []net.Interface
+	var selected []interfaceInfo
 	for _, iface := range all {
+		if _, ok := types[iface.Type]; ok {
+			selected = append(selected, iface)
+			continue
+		}
 		if _, ok := names[iface.Name]; ok {
 			selected = append(selected, iface)
 			continue
@@ -378,24 +435,6 @@ func writeAllowedMap[K comparable](m *ebpf.Map, keys []K, name string) error {
 		}
 	}
 	return nil
-}
-
-func attachEgress(program *ebpf.Program, ifaces []net.Interface) ([]link.Link, error) {
-	links := make([]link.Link, 0, len(ifaces))
-	for _, iface := range ifaces {
-		l, err := link.AttachTCX(link.TCXOptions{
-			Interface: iface.Index,
-			Program:   program,
-			Attach:    ebpf.AttachTCXEgress,
-		})
-		if err != nil {
-			closeLinks(links)
-			return nil, fmt.Errorf("attach tc egress program to %s(index %d): %w", iface.Name, iface.Index, err)
-		}
-		log.Printf("Attached tc egress program to %s(index %d)", iface.Name, iface.Index)
-		links = append(links, l)
-	}
-	return links, nil
 }
 
 func allowedPortKeys(values []string) ([]portKey, error) {
@@ -464,14 +503,6 @@ func allowedV6HostportKeys(values []string) ([]hostport6Key, error) {
 		})
 	}
 	return keys, nil
-}
-
-func closeLinks(links []link.Link) {
-	for _, l := range links {
-		if err := l.Close(); err != nil {
-			log.Printf("closing link: %s", err)
-		}
-	}
 }
 
 func readBootstrapEvents(reader *ringbuf.Reader) error {
@@ -551,7 +582,204 @@ func formatBootstrapEvent(event bootstrapEvent) string {
 	)
 }
 
-func interfaceNames(ifaces []net.Interface) string {
+func newEgressManager(program *ebpf.Program) *egressManager {
+	return &egressManager{
+		program:  program,
+		attached: make(map[int]attachedInterface),
+	}
+}
+
+func (m *egressManager) reconcileCurrent(opts options, strict bool) (bool, error) {
+	selected, err := selectedInterfaces(opts)
+	if err != nil {
+		return false, err
+	}
+	if len(selected) == 0 {
+		log.Print("No interfaces currently match the configured selectors")
+	}
+	return m.reconcile(selected, strict)
+}
+
+func (m *egressManager) reconcile(selected []interfaceInfo, strict bool) (bool, error) {
+	desired := make(map[int]interfaceInfo, len(selected))
+	for _, iface := range selected {
+		desired[iface.Index] = iface
+	}
+
+	changed := false
+	for index, attached := range m.attached {
+		if _, ok := desired[index]; ok {
+			continue
+		}
+		if err := attached.link.Close(); err != nil {
+			log.Printf("ERROR: detach tc egress program from %s(index %d type %s): %s", attached.info.Name, attached.info.Index, attached.info.Type, err)
+		} else {
+			log.Printf("Detached tc egress program from %s(index %d type %s)", attached.info.Name, attached.info.Index, attached.info.Type)
+		}
+		delete(m.attached, index)
+		changed = true
+	}
+
+	var attachErr error
+	for _, iface := range selected {
+		if attached, ok := m.attached[iface.Index]; ok {
+			attached.info = iface
+			m.attached[iface.Index] = attached
+			continue
+		}
+
+		l, err := link.AttachTCX(link.TCXOptions{
+			Interface: iface.Index,
+			Program:   m.program,
+			Attach:    ebpf.AttachTCXEgress,
+		})
+		if err != nil {
+			err = fmt.Errorf("attach tc egress program to %s(index %d type %s): %w", iface.Name, iface.Index, iface.Type, err)
+			log.Printf("ERROR: %s", err)
+			attachErr = errors.Join(attachErr, err)
+			continue
+		}
+		m.attached[iface.Index] = attachedInterface{link: l, info: iface}
+		log.Printf("Attached tc egress program to %s(index %d type %s)", iface.Name, iface.Index, iface.Type)
+		changed = true
+	}
+
+	if changed {
+		log.Printf("Kill switch attached to: %s", interfaceNames(m.attachedInterfaces()))
+	}
+	if strict {
+		return changed, attachErr
+	}
+	return changed, nil
+}
+
+func (m *egressManager) attachedInterfaces() []interfaceInfo {
+	ifaces := make([]interfaceInfo, 0, len(m.attached))
+	for _, attached := range m.attached {
+		ifaces = append(ifaces, attached.info)
+	}
+	sort.Slice(ifaces, func(i, j int) bool {
+		return ifaces[i].Name < ifaces[j].Name
+	})
+	return ifaces
+}
+
+func (m *egressManager) close() {
+	for index, attached := range m.attached {
+		if err := attached.link.Close(); err != nil {
+			log.Printf("closing link for %s(index %d): %s", attached.info.Name, attached.info.Index, err)
+		}
+		delete(m.attached, index)
+	}
+}
+
+func watchInterfaces(ctx context.Context, manager *egressManager, opts options) error {
+	updates := make(chan netlink.LinkUpdate, 32)
+	done := make(chan struct{})
+	defer close(done)
+
+	subscribeErrs := make(chan error, 1)
+	errCallback := func(err error) {
+		select {
+		case subscribeErrs <- err:
+		default:
+			log.Printf("ERROR: netlink link watcher: %s", err)
+		}
+	}
+
+	if err := netlink.LinkSubscribeWithOptions(updates, done, netlink.LinkSubscribeOptions{
+		ErrorCallback: errCallback,
+	}); err != nil {
+		return fmt.Errorf("subscribe to netlink link updates: %w", err)
+	}
+
+	if _, err := manager.reconcileCurrent(opts, true); err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-subscribeErrs:
+			return fmt.Errorf("netlink link watcher: %w", err)
+		case update := <-updates:
+			if !manager.shouldReconcileLinkUpdate(update, opts) {
+				continue
+			}
+			logLinkUpdate(update)
+			if _, err := manager.reconcileCurrent(opts, false); err != nil {
+				log.Printf("ERROR: reconcile interfaces after netlink update: %s", err)
+			}
+		}
+	}
+}
+
+func (m *egressManager) shouldReconcileLinkUpdate(update netlink.LinkUpdate, opts options) bool {
+	if update.Link == nil || update.Link.Attrs() == nil { //nolint:staticcheck
+		return true
+	}
+
+	attrs := update.Link.Attrs() //nolint:staticcheck
+	switch update.Header.Type {
+	case unix.RTM_DELLINK:
+		return m.isAttached(attrs.Index)
+	case unix.RTM_NEWLINK:
+		matches, err := interfaceMatchesSelectors(interfaceInfo{
+			Index: attrs.Index,
+			Name:  attrs.Name,
+			Type:  update.Link.Type(), //nolint:staticcheck
+		}, opts)
+		if err != nil {
+			log.Printf("ERROR: match netlink link update selectors: %s", err)
+			return true
+		}
+		return matches != m.isAttached(attrs.Index)
+	default:
+		return false
+	}
+}
+
+func (m *egressManager) isAttached(index int) bool {
+	_, ok := m.attached[index]
+	return ok
+}
+
+func interfaceMatchesSelectors(iface interfaceInfo, opts options) (bool, error) {
+	for _, typ := range opts.InterfaceTypes {
+		if iface.Type == typ {
+			return true, nil
+		}
+	}
+	for _, name := range opts.InterfaceNames {
+		if iface.Name == name {
+			return true, nil
+		}
+	}
+	for _, pattern := range opts.InterfaceRegexps {
+		matches, err := regexp.MatchString(pattern, iface.Name)
+		if err != nil {
+			return false, fmt.Errorf("compile interface regexp %q: %w", pattern, err)
+		}
+		if matches {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func logLinkUpdate(update netlink.LinkUpdate) {
+
+	if update.Link == nil || update.Link.Attrs() == nil { //nolint:staticcheck
+		log.Print("Netlink link update received")
+		return
+	} //nolint:staticcheck
+	attrs := update.Link.Attrs() //nolint:staticcheck
+
+	log.Printf("Netlink link update: %s(index %d type %s)", attrs.Name, attrs.Index, update.Link.Type()) //nolint:staticcheck
+}
+
+func interfaceNames(ifaces []interfaceInfo) string {
 	names := make([]string, 0, len(ifaces))
 	for _, iface := range ifaces {
 		names = append(names, iface.Name)
