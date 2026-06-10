@@ -16,6 +16,7 @@
 
 // L4 protocol constants used for built-in bootstrap packet detection.
 #define IPPROTO_ICMPV6 58
+#define IPPROTO_TCP 6
 #define IPPROTO_UDP 17
 
 // tc classifier return codes. OK continues normal packet processing, while
@@ -76,6 +77,11 @@ struct udphdr {
     __sum16 check;
 };
 
+struct tcphdr {
+    __be16 source;
+    __be16 dest;
+};
+
 struct ipv6hdr {
     __u8 priority_version;
     __u8 flow_lbl[3];
@@ -101,6 +107,32 @@ struct runtime_config {
     __u8 enable_v4;
     __u8 enable_v6;
     __u8 reserved0;
+};
+
+struct port_key {
+    __be16 dport;
+    __u8 protocol;
+    __u8 reserved0;
+};
+
+struct ipv6_addr_key {
+    __u8 addr[16];
+};
+
+struct hostport4_key {
+    __be32 daddr;
+    __be16 dport;
+    __u16 reserved0;
+    __u8 protocol;
+    __u8 reserved1[3];
+};
+
+struct hostport6_key {
+    __u8 daddr[16];
+    __be16 dport;
+    __u16 reserved0;
+    __u8 protocol;
+    __u8 reserved1[3];
 };
 
 // bootstrap_event is the ring-buffer record consumed by userspace.
@@ -141,6 +173,48 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 20);
 } bootstrap_events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u32);
+    __type(value, __u8);
+    __uint(max_entries, 1024);
+} allowed_marks SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct port_key);
+    __type(value, __u8);
+    __uint(max_entries, 1024);
+} allowed_ports SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __be32);
+    __type(value, __u8);
+    __uint(max_entries, 1024);
+} allowed_v4_hosts SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct ipv6_addr_key);
+    __type(value, __u8);
+    __uint(max_entries, 1024);
+} allowed_v6_hosts SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct hostport4_key);
+    __type(value, __u8);
+    __uint(max_entries, 1024);
+} allowed_v4_hostports SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct hostport6_key);
+    __type(value, __u8);
+    __uint(max_entries, 1024);
+} allowed_v6_hostports SEC(".maps");
 
 // data_available is the verifier-friendly bounds check used before every packet
 // header read. The verifier tracks cursor + constant/validated sizes and allows
@@ -220,6 +294,52 @@ static __always_inline int is_icmpv6_nd(struct icmp6hdr *icmp6) {
     return icmp6->icmp6_type >= 133 && icmp6->icmp6_type <= 136;
 }
 
+static __always_inline int mark_allowed(struct __sk_buff *skb) {
+    __u32 mark = skb->mark;
+
+    return bpf_map_lookup_elem(&allowed_marks, &mark) != 0;
+}
+
+static __always_inline int port_allowed(__u8 protocol, __be16 dport) {
+    struct port_key key = {
+        .dport = dport,
+        .protocol = protocol,
+    };
+
+    return bpf_map_lookup_elem(&allowed_ports, &key) != 0;
+}
+
+static __always_inline int v4_host_allowed(__be32 daddr) {
+    return bpf_map_lookup_elem(&allowed_v4_hosts, &daddr) != 0;
+}
+
+static __always_inline int v6_host_allowed(const __u8 daddr[16]) {
+    struct ipv6_addr_key key = {};
+
+    copy_ipv6_addr(key.addr, daddr);
+    return bpf_map_lookup_elem(&allowed_v6_hosts, &key) != 0;
+}
+
+static __always_inline int v4_hostport_allowed(__be32 daddr, __u8 protocol, __be16 dport) {
+    struct hostport4_key key = {
+        .daddr = daddr,
+        .dport = dport,
+        .protocol = protocol,
+    };
+
+    return bpf_map_lookup_elem(&allowed_v4_hostports, &key) != 0;
+}
+
+static __always_inline int v6_hostport_allowed(const __u8 daddr[16], __u8 protocol, __be16 dport) {
+    struct hostport6_key key = {
+        .dport = dport,
+        .protocol = protocol,
+    };
+
+    copy_ipv6_addr(key.daddr, daddr);
+    return bpf_map_lookup_elem(&allowed_v6_hostports, &key) != 0;
+}
+
 // killswitch_egress enforces the fail-closed policy at tc egress.
 //
 // Policy order:
@@ -227,7 +347,8 @@ static __always_inline int is_icmpv6_nd(struct icmp6hdr *icmp6) {
 //  2. Malformed packets drop.
 //  3. ARP, DHCPv4, DHCPv6, and ICMPv6 ND pass and emit bootstrap debug events.
 //  4. IPv4/IPv6 enable flags gate routable IP traffic.
-//  5. Everything else drops by default.
+//  5. fwmark, port, host, and host+port allowlists pass matching packets.
+//  6. Everything else drops by default.
 SEC("tc")
 int killswitch_egress(struct __sk_buff *skb) {
     __u32 key = 0;
@@ -272,8 +393,10 @@ int killswitch_egress(struct __sk_buff *skb) {
 
     if (eth_proto == ETH_P_IP) {
         struct iphdr *ip = cursor;
+        __be16 dport = 0;
         __u32 ihl_len;
         __u16 frag_off;
+        __u8 has_ports = 0;
 
         // First validate the fixed IPv4 header so reading ihl/version is safe.
         if (!data_available(ip, data_end, sizeof(*ip))) {
@@ -303,10 +426,20 @@ int killswitch_egress(struct __sk_buff *skb) {
             if (!data_available(udp, data_end, sizeof(*udp))) {
                 return TC_ACT_SHOT;
             }
+            dport = udp->dest;
+            has_ports = 1;
             if (is_dhcpv4(udp)) {
                 emit_bootstrap_event(skb, eth_proto, BOOTSTRAP_DHCPV4, vlan_depth, ip, 0, udp, 0);
                 return TC_ACT_OK;
             }
+        } else if (ip->protocol == IPPROTO_TCP) {
+            struct tcphdr *tcp = (void *)ip + ihl_len;
+
+            if (!data_available(tcp, data_end, sizeof(*tcp))) {
+                return TC_ACT_SHOT;
+            }
+            dport = tcp->dest;
+            has_ports = 1;
         }
 
         if (!config || !config->enable_v4) {
@@ -314,12 +447,26 @@ int killswitch_egress(struct __sk_buff *skb) {
             return TC_ACT_SHOT;
         }
 
-        // There is no allowlist maps yet, so enabled IPv4 still fails closed.
+        if (mark_allowed(skb)) {
+            return TC_ACT_OK;
+        }
+        if (has_ports && port_allowed(ip->protocol, dport)) {
+            return TC_ACT_OK;
+        }
+        if (v4_host_allowed(ip->daddr)) {
+            return TC_ACT_OK;
+        }
+        if (has_ports && v4_hostport_allowed(ip->daddr, ip->protocol, dport)) {
+            return TC_ACT_OK;
+        }
+
         return TC_ACT_SHOT;
     }
 
     if (eth_proto == ETH_P_IPV6) {
         struct ipv6hdr *ip6 = cursor;
+        __be16 dport = 0;
+        __u8 has_ports = 0;
         __u8 version;
 
         if (!data_available(ip6, data_end, sizeof(*ip6))) {
@@ -330,8 +477,8 @@ int killswitch_egress(struct __sk_buff *skb) {
             return TC_ACT_SHOT;
         }
 
-        // For now deliberately keeps IPv6 strict: only direct UDP and ICMPv6
-        // headers are parsed. Extension headers and other next-header values
+        // For now deliberately keeps IPv6 strict: only direct UDP, TCP, and
+        // ICMPv6 headers are parsed. Extension headers and other next-header values
         // are dropped until bounded extension-header walking is added.
         if (ip6->nexthdr == IPPROTO_UDP) {
             struct udphdr *udp = (void *)ip6 + sizeof(*ip6);
@@ -339,10 +486,20 @@ int killswitch_egress(struct __sk_buff *skb) {
             if (!data_available(udp, data_end, sizeof(*udp))) {
                 return TC_ACT_SHOT;
             }
+            dport = udp->dest;
+            has_ports = 1;
             if (is_dhcpv6(udp)) {
                 emit_bootstrap_event(skb, eth_proto, BOOTSTRAP_DHCPV6, vlan_depth, 0, ip6, udp, 0);
                 return TC_ACT_OK;
             }
+        } else if (ip6->nexthdr == IPPROTO_TCP) {
+            struct tcphdr *tcp = (void *)ip6 + sizeof(*ip6);
+
+            if (!data_available(tcp, data_end, sizeof(*tcp))) {
+                return TC_ACT_SHOT;
+            }
+            dport = tcp->dest;
+            has_ports = 1;
         } else if (ip6->nexthdr == IPPROTO_ICMPV6) {
             struct icmp6hdr *icmp6 = (void *)ip6 + sizeof(*ip6);
 
@@ -362,7 +519,19 @@ int killswitch_egress(struct __sk_buff *skb) {
             return TC_ACT_SHOT;
         }
 
-        // There are no allowlist maps yet, so enabled IPv6 still fails closed.
+        if (mark_allowed(skb)) {
+            return TC_ACT_OK;
+        }
+        if (has_ports && port_allowed(ip6->nexthdr, dport)) {
+            return TC_ACT_OK;
+        }
+        if (v6_host_allowed(ip6->daddr)) {
+            return TC_ACT_OK;
+        }
+        if (has_ports && v6_hostport_allowed(ip6->daddr, ip6->nexthdr, dport)) {
+            return TC_ACT_OK;
+        }
+
         return TC_ACT_SHOT;
     }
 

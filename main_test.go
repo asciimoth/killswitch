@@ -25,6 +25,12 @@ func TestParseFlags(t *testing.T) {
 		"-iface-regex", "^en",
 		"-allow-all",
 		"-enable-v4",
+		"-allow-mark", "0x42",
+		"-allow-port", "udp/51820",
+		"-allow-v4-host", "192.0.2.10",
+		"-allow-v6-host", "2001:db8::10",
+		"-allow-v4-hostport", "tcp/198.51.100.20:443",
+		"-allow-v6-hostport", "udp/[2001:db8::20]:51820",
 	})
 	if err != nil {
 		t.Fatalf("parse flags: %v", err)
@@ -38,6 +44,41 @@ func TestParseFlags(t *testing.T) {
 	}
 	if !opts.AllowAll || !opts.EnableV4 || opts.EnableV6 {
 		t.Fatalf("unexpected bool flags: %+v", opts)
+	}
+	if len(opts.AllowedMarks) != 1 || opts.AllowedMarks[0] != 0x42 {
+		t.Fatalf("unexpected allowed marks: %+v", opts.AllowedMarks)
+	}
+	if len(opts.AllowedPorts) != 1 || opts.AllowedPorts[0] != (portKey{Dport: htons(51820), Protocol: ipProtoUDP}) {
+		t.Fatalf("unexpected allowed ports: %+v", opts.AllowedPorts)
+	}
+	if len(opts.AllowedV4Hosts) != 1 || opts.AllowedV4Hosts[0] != 0x0a0200c0 {
+		t.Fatalf("unexpected allowed v4 hosts: %+v", opts.AllowedV4Hosts)
+	}
+	if len(opts.AllowedV6Hosts) != 1 || opts.AllowedV6Hosts[0].Addr != ipv6Bytes(t, "2001:db8::10") {
+		t.Fatalf("unexpected allowed v6 hosts: %+v", opts.AllowedV6Hosts)
+	}
+	if len(opts.AllowedV4Pairs) != 1 || opts.AllowedV4Pairs[0].Daddr != 0x146433c6 || opts.AllowedV4Pairs[0].Dport != htons(443) || opts.AllowedV4Pairs[0].Protocol != ipProtoTCP {
+		t.Fatalf("unexpected allowed v4 hostports: %+v", opts.AllowedV4Pairs)
+	}
+	if len(opts.AllowedV6Pairs) != 1 || opts.AllowedV6Pairs[0].Daddr != ipv6Bytes(t, "2001:db8::20") || opts.AllowedV6Pairs[0].Dport != htons(51820) || opts.AllowedV6Pairs[0].Protocol != ipProtoUDP {
+		t.Fatalf("unexpected allowed v6 hostports: %+v", opts.AllowedV6Pairs)
+	}
+}
+
+func TestParseAllowlistValidation(t *testing.T) {
+	tests := [][]string{
+		{"-iface", "eth0", "-allow-port", "icmp/443"},
+		{"-iface", "eth0", "-allow-port", "tcp/0"},
+		{"-iface", "eth0", "-allow-v4-host", "2001:db8::1"},
+		{"-iface", "eth0", "-allow-v6-host", "192.0.2.1"},
+		{"-iface", "eth0", "-allow-v4-hostport", "udp/[2001:db8::1]:53"},
+		{"-iface", "eth0", "-allow-v6-hostport", "udp/192.0.2.1:53"},
+	}
+
+	for _, args := range tests {
+		if _, err := parseFlags(args); err == nil {
+			t.Fatalf("parseFlags(%v) succeeded, expected error", args)
+		}
 	}
 }
 

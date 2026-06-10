@@ -13,6 +13,36 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type killswitchHostport4Key struct {
+	_         structs.HostLayout
+	Daddr     uint32
+	Dport     uint16
+	Reserved0 uint16
+	Protocol  uint8
+	Reserved1 [3]uint8
+}
+
+type killswitchHostport6Key struct {
+	_         structs.HostLayout
+	Daddr     [16]uint8
+	Dport     uint16
+	Reserved0 uint16
+	Protocol  uint8
+	Reserved1 [3]uint8
+}
+
+type killswitchIpv6AddrKey struct {
+	_    structs.HostLayout
+	Addr [16]uint8
+}
+
+type killswitchPortKey struct {
+	_         structs.HostLayout
+	Dport     uint16
+	Protocol  uint8
+	Reserved0 uint8
+}
+
 type killswitchRuntimeConfig struct {
 	_         structs.HostLayout
 	AllowAll  uint8
@@ -70,8 +100,14 @@ type killswitchProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type killswitchMapSpecs struct {
-	BootstrapEvents *ebpf.MapSpec `ebpf:"bootstrap_events"`
-	RuntimeConfig   *ebpf.MapSpec `ebpf:"runtime_config"`
+	AllowedMarks       *ebpf.MapSpec `ebpf:"allowed_marks"`
+	AllowedPorts       *ebpf.MapSpec `ebpf:"allowed_ports"`
+	AllowedV4Hostports *ebpf.MapSpec `ebpf:"allowed_v4_hostports"`
+	AllowedV4Hosts     *ebpf.MapSpec `ebpf:"allowed_v4_hosts"`
+	AllowedV6Hostports *ebpf.MapSpec `ebpf:"allowed_v6_hostports"`
+	AllowedV6Hosts     *ebpf.MapSpec `ebpf:"allowed_v6_hosts"`
+	BootstrapEvents    *ebpf.MapSpec `ebpf:"bootstrap_events"`
+	RuntimeConfig      *ebpf.MapSpec `ebpf:"runtime_config"`
 }
 
 // killswitchVariableSpecs contains global variables before they are loaded into the kernel.
@@ -100,12 +136,24 @@ func (o *killswitchObjects) Close() error {
 //
 // It can be passed to loadKillswitchObjects or ebpf.CollectionSpec.LoadAndAssign.
 type killswitchMaps struct {
-	BootstrapEvents *ebpf.Map `ebpf:"bootstrap_events"`
-	RuntimeConfig   *ebpf.Map `ebpf:"runtime_config"`
+	AllowedMarks       *ebpf.Map `ebpf:"allowed_marks"`
+	AllowedPorts       *ebpf.Map `ebpf:"allowed_ports"`
+	AllowedV4Hostports *ebpf.Map `ebpf:"allowed_v4_hostports"`
+	AllowedV4Hosts     *ebpf.Map `ebpf:"allowed_v4_hosts"`
+	AllowedV6Hostports *ebpf.Map `ebpf:"allowed_v6_hostports"`
+	AllowedV6Hosts     *ebpf.Map `ebpf:"allowed_v6_hosts"`
+	BootstrapEvents    *ebpf.Map `ebpf:"bootstrap_events"`
+	RuntimeConfig      *ebpf.Map `ebpf:"runtime_config"`
 }
 
 func (m *killswitchMaps) Close() error {
 	return _KillswitchClose(
+		m.AllowedMarks,
+		m.AllowedPorts,
+		m.AllowedV4Hostports,
+		m.AllowedV4Hosts,
+		m.AllowedV6Hostports,
+		m.AllowedV6Hosts,
 		m.BootstrapEvents,
 		m.RuntimeConfig,
 	)
