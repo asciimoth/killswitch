@@ -14,10 +14,11 @@ import (
 )
 
 type killswitchRuntimeConfig struct {
-	_        structs.HostLayout
-	AllowAll uint8
-	EnableV4 uint8
-	EnableV6 uint8
+	_         structs.HostLayout
+	AllowAll  uint8
+	EnableV4  uint8
+	EnableV6  uint8
+	Reserved0 uint8
 }
 
 // loadKillswitch returns the embedded CollectionSpec for killswitch.

@@ -27,6 +27,8 @@ import (
 const (
 	bootstrapARP    = 1
 	bootstrapDHCPv4 = 2
+	bootstrapDHCPv6 = 3
+	bootstrapICMPv6 = 4
 )
 
 // runtimeConfig mirrors struct runtime_config in killswitch.c. Keep this type
@@ -45,11 +47,16 @@ type bootstrapEvent struct {
 	Ifindex     uint32
 	EthProto    uint16
 	Reason      uint8
-	Reserved    uint8
+	IPProto     uint8
 	IPv4Saddr   uint32
 	IPv4Daddr   uint32
+	IPv6Saddr   [16]byte
+	IPv6Daddr   [16]byte
 	SourcePort  uint16
 	DestPort    uint16
+	ICMPv6Type  uint8
+	VLANDepth   uint8
+	Reserved    uint16
 }
 
 type stringList []string
@@ -171,7 +178,7 @@ func run(parent context.Context, opts options) error {
 		_ = reader.Close()
 	}()
 
-	log.Printf("Phase 1 kill switch attached to: %s", interfaceNames(ifaces))
+	log.Printf("Kill switch attached to: %s", interfaceNames(ifaces))
 	log.Printf("Runtime config: allow_all=%t enable_v4=%t enable_v6=%t", opts.AllowAll, opts.EnableV4, opts.EnableV6)
 
 	if err := readBootstrapEvents(reader); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
@@ -288,6 +295,10 @@ func formatBootstrapEvent(event bootstrapEvent) string {
 		reason = "arp"
 	case bootstrapDHCPv4:
 		reason = "dhcpv4"
+	case bootstrapDHCPv6:
+		reason = "dhcpv6"
+	case bootstrapICMPv6:
+		reason = "icmpv6_nd"
 	}
 
 	if event.Reason == bootstrapDHCPv4 {
@@ -300,11 +311,33 @@ func formatBootstrapEvent(event bootstrapEvent) string {
 			ntohs(event.DestPort),
 		)
 	}
+	if event.Reason == bootstrapDHCPv6 {
+		return fmt.Sprintf("bootstrap pass: reason=%s ifindex=%d src=[%s]:%d dst=[%s]:%d vlan_depth=%d",
+			reason,
+			event.Ifindex,
+			net.IP(event.IPv6Saddr[:]),
+			ntohs(event.SourcePort),
+			net.IP(event.IPv6Daddr[:]),
+			ntohs(event.DestPort),
+			event.VLANDepth,
+		)
+	}
+	if event.Reason == bootstrapICMPv6 {
+		return fmt.Sprintf("bootstrap pass: reason=%s ifindex=%d src=%s dst=%s type=%d vlan_depth=%d",
+			reason,
+			event.Ifindex,
+			net.IP(event.IPv6Saddr[:]),
+			net.IP(event.IPv6Daddr[:]),
+			event.ICMPv6Type,
+			event.VLANDepth,
+		)
+	}
 
-	return fmt.Sprintf("bootstrap pass: reason=%s ifindex=%d eth_proto=0x%04x",
+	return fmt.Sprintf("bootstrap pass: reason=%s ifindex=%d eth_proto=0x%04x vlan_depth=%d",
 		reason,
 		event.Ifindex,
 		event.EthProto,
+		event.VLANDepth,
 	)
 }
 

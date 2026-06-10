@@ -64,11 +64,12 @@ func TestSelectInterfacesByNameAndRegexp(t *testing.T) {
 
 func TestFormatBootstrapEvents(t *testing.T) {
 	arp := formatBootstrapEvent(bootstrapEvent{
-		Ifindex:  4,
-		EthProto: 0x0806,
-		Reason:   bootstrapARP,
+		Ifindex:   4,
+		EthProto:  0x0806,
+		Reason:    bootstrapARP,
+		VLANDepth: 1,
 	})
-	if !strings.Contains(arp, "reason=arp") || !strings.Contains(arp, "eth_proto=0x0806") {
+	if !strings.Contains(arp, "reason=arp") || !strings.Contains(arp, "eth_proto=0x0806") || !strings.Contains(arp, "vlan_depth=1") {
 		t.Fatalf("unexpected ARP event: %s", arp)
 	}
 
@@ -83,6 +84,30 @@ func TestFormatBootstrapEvents(t *testing.T) {
 	if !strings.Contains(dhcp, "src=192.168.1.1:68") || !strings.Contains(dhcp, "dst=255.255.255.255:67") {
 		t.Fatalf("unexpected DHCP event: %s", dhcp)
 	}
+
+	dhcp6 := formatBootstrapEvent(bootstrapEvent{
+		Ifindex:    6,
+		Reason:     bootstrapDHCPv6,
+		IPv6Saddr:  ipv6Bytes(t, "fe80::1"),
+		IPv6Daddr:  ipv6Bytes(t, "ff02::1:2"),
+		SourcePort: 0x2202,
+		DestPort:   0x2302,
+		VLANDepth:  1,
+	})
+	if !strings.Contains(dhcp6, "reason=dhcpv6") || !strings.Contains(dhcp6, "src=[fe80::1]:546") || !strings.Contains(dhcp6, "dst=[ff02::1:2]:547") || !strings.Contains(dhcp6, "vlan_depth=1") {
+		t.Fatalf("unexpected DHCPv6 event: %s", dhcp6)
+	}
+
+	nd := formatBootstrapEvent(bootstrapEvent{
+		Ifindex:    7,
+		Reason:     bootstrapICMPv6,
+		IPv6Saddr:  ipv6Bytes(t, "fe80::2"),
+		IPv6Daddr:  ipv6Bytes(t, "ff02::1"),
+		ICMPv6Type: 135,
+	})
+	if !strings.Contains(nd, "reason=icmpv6_nd") || !strings.Contains(nd, "src=fe80::2") || !strings.Contains(nd, "dst=ff02::1") || !strings.Contains(nd, "type=135") {
+		t.Fatalf("unexpected ICMPv6 ND event: %s", nd)
+	}
 }
 
 func TestRuntimeConfigBoolEncoding(t *testing.T) {
@@ -95,4 +120,17 @@ func TestRuntimeConfigBoolEncoding(t *testing.T) {
 	if config.AllowAll != 1 || config.EnableV4 != 0 || config.EnableV6 != 1 {
 		t.Fatalf("unexpected runtime config encoding: %+v", config)
 	}
+}
+
+func ipv6Bytes(t *testing.T, value string) [16]byte {
+	t.Helper()
+
+	parsed := net.ParseIP(value).To16()
+	if parsed == nil {
+		t.Fatalf("parse IPv6 address %q", value)
+	}
+
+	var out [16]byte
+	copy(out[:], parsed)
+	return out
 }
