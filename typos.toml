@@ -1,6 +1,5 @@
 [default.extend-words]
-importas = "importas"
-SNET = "SNET"
+ND = "ND"
 
 [files]
 extend-exclude = ["filter_test.go"]
