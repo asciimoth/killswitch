@@ -8,8 +8,8 @@ import (
 	"testing"
 )
 
-func TestParseFlagsRequiresInterfaceSelector(t *testing.T) {
-	_, err := parseFlags(nil)
+func TestConfigRequiresInterfaceSelector(t *testing.T) {
+	_, err := configToOptions(configFile{})
 	if err == nil {
 		t.Fatal("expected missing selector error")
 	}
@@ -18,23 +18,78 @@ func TestParseFlagsRequiresInterfaceSelector(t *testing.T) {
 	}
 }
 
-func TestParseFlags(t *testing.T) {
-	opts, err := parseFlags([]string{
-		"-iface", "eth0",
-		"-iface", "wlan0",
-		"-iface-regex", "^en",
-		"-allow-all",
-		"-enable-v4",
-		"-allow-mark", "0x42",
-		"-allow-port", "udp/51820",
-		"-allow-v4-host", "192.0.2.10",
-		"-allow-v6-host", "2001:db8::10",
-		"-allow-v4-hostport", "tcp/198.51.100.20:443",
-		"-allow-v6-hostport", "udp/[2001:db8::20]:51820",
+func TestParseArgs(t *testing.T) {
+	path, err := parseArgs(nil)
+	if err != nil {
+		t.Fatalf("parse default args: %v", err)
+	}
+	if path != defaultConfigPath {
+		t.Fatalf("default config path = %q", path)
+	}
+
+	path, err = parseArgs([]string{"-"})
+	if err != nil {
+		t.Fatalf("parse stdin args: %v", err)
+	}
+	if path != "-" {
+		t.Fatalf("stdin config path = %q", path)
+	}
+
+	path, err = parseArgs([]string{"./killswitch.json"})
+	if err != nil {
+		t.Fatalf("parse config path arg: %v", err)
+	}
+	if path != "./killswitch.json" {
+		t.Fatalf("config path = %q", path)
+	}
+
+	if _, err := parseArgs([]string{"one.json", "two.json"}); err == nil {
+		t.Fatal("expected too many args error")
+	}
+}
+
+func TestLoadOptionsFromStdin(t *testing.T) {
+	opts, err := loadOptions("-", strings.NewReader(`{
+		"interface_names": ["eth0", "wlan0"],
+		"interface_regexps": ["^en"],
+		"allow_all": true,
+		"enable_v4": true,
+		"allowed_marks": ["0x42"],
+		"allowed_ports": ["udp/51820"],
+		"allowed_v4_hosts": ["192.0.2.10"],
+		"allowed_v6_hosts": ["2001:db8::10"],
+		"allowed_v4_hostports": ["tcp/198.51.100.20:443"],
+		"allowed_v6_hostports": ["udp/[2001:db8::20]:51820"]
+	}`))
+	if err != nil {
+		t.Fatalf("load options: %v", err)
+	}
+
+	assertParsedOptions(t, opts)
+}
+
+func TestConfigToOptions(t *testing.T) {
+	opts, err := configToOptions(configFile{
+		InterfaceNames:   []string{"eth0", "wlan0"},
+		InterfaceRegexps: []string{"^en"},
+		AllowAll:         true,
+		EnableV4:         true,
+		AllowedMarks:     []string{"0x42"},
+		AllowedPorts:     []string{"udp/51820"},
+		AllowedV4Hosts:   []string{"192.0.2.10"},
+		AllowedV6Hosts:   []string{"2001:db8::10"},
+		AllowedV4Pairs:   []string{"tcp/198.51.100.20:443"},
+		AllowedV6Pairs:   []string{"udp/[2001:db8::20]:51820"},
 	})
 	if err != nil {
-		t.Fatalf("parse flags: %v", err)
+		t.Fatalf("config to options: %v", err)
 	}
+
+	assertParsedOptions(t, opts)
+}
+
+func assertParsedOptions(t *testing.T, opts options) {
+	t.Helper()
 
 	if got := strings.Join(opts.InterfaceNames, ","); got != "eth0,wlan0" {
 		t.Fatalf("interface names = %q", got)
@@ -66,18 +121,18 @@ func TestParseFlags(t *testing.T) {
 }
 
 func TestParseAllowlistValidation(t *testing.T) {
-	tests := [][]string{
-		{"-iface", "eth0", "-allow-port", "icmp/443"},
-		{"-iface", "eth0", "-allow-port", "tcp/0"},
-		{"-iface", "eth0", "-allow-v4-host", "2001:db8::1"},
-		{"-iface", "eth0", "-allow-v6-host", "192.0.2.1"},
-		{"-iface", "eth0", "-allow-v4-hostport", "udp/[2001:db8::1]:53"},
-		{"-iface", "eth0", "-allow-v6-hostport", "udp/192.0.2.1:53"},
+	tests := []configFile{
+		{InterfaceNames: []string{"eth0"}, AllowedPorts: []string{"icmp/443"}},
+		{InterfaceNames: []string{"eth0"}, AllowedPorts: []string{"tcp/0"}},
+		{InterfaceNames: []string{"eth0"}, AllowedV4Hosts: []string{"2001:db8::1"}},
+		{InterfaceNames: []string{"eth0"}, AllowedV6Hosts: []string{"192.0.2.1"}},
+		{InterfaceNames: []string{"eth0"}, AllowedV4Pairs: []string{"udp/[2001:db8::1]:53"}},
+		{InterfaceNames: []string{"eth0"}, AllowedV6Pairs: []string{"udp/192.0.2.1:53"}},
 	}
 
-	for _, args := range tests {
-		if _, err := parseFlags(args); err == nil {
-			t.Fatalf("parseFlags(%v) succeeded, expected error", args)
+	for _, cfg := range tests {
+		if _, err := configToOptions(cfg); err == nil {
+			t.Fatalf("configToOptions(%+v) succeeded, expected error", cfg)
 		}
 	}
 }

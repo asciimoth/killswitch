@@ -1,7 +1,7 @@
 package main
 
-import "fmt"
+import "log"
 
 func main() {
-	fmt.Println("killswitch-user desktop daemon integration stub")
+	log.Print("killswitch-user desktop daemon integration stub")
 }

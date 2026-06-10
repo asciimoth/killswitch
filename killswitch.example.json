@@ -1,0 +1,36 @@
+{
+  "interface_names": [
+    "eth0",
+    "wlan0"
+  ],
+  "interface_regexps": [
+    "^(en|wl|ww)"
+  ],
+  "allow_all": false,
+  "enable_v4": true,
+  "enable_v6": true,
+  "allowed_marks": [
+    "0x42",
+    "100"
+  ],
+  "allowed_ports": [
+    "tcp/443",
+    "udp/51820"
+  ],
+  "allowed_v4_hosts": [
+    "198.51.100.10",
+    "203.0.113.20"
+  ],
+  "allowed_v6_hosts": [
+    "2001:db8::10",
+    "2001:db8::20"
+  ],
+  "allowed_v4_hostports": [
+    "tcp/198.51.100.10:443",
+    "udp/203.0.113.20:51820"
+  ],
+  "allowed_v6_hostports": [
+    "tcp/[2001:db8::10]:443",
+    "udp/[2001:db8::20]:51820"
+  ]
+}

@@ -6,9 +6,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
@@ -34,6 +35,8 @@ const (
 
 	ipProtoTCP = policy.IPProtoTCP
 	ipProtoUDP = policy.IPProtoUDP
+
+	defaultConfigPath = "/etc/killswitch/killswitch.json"
 )
 
 // runtimeConfig mirrors struct runtime_config in killswitch.c. Keep this type
@@ -96,20 +99,6 @@ type hostport6Key struct {
 	Reserved1 [3]byte
 }
 
-type stringList []string
-
-func (s *stringList) String() string {
-	return strings.Join(*s, ",")
-}
-
-func (s *stringList) Set(value string) error {
-	if value == "" {
-		return errors.New("empty value")
-	}
-	*s = append(*s, value)
-	return nil
-}
-
 type options struct {
 	InterfaceNames   []string
 	InterfaceRegexps []string
@@ -124,8 +113,27 @@ type options struct {
 	AllowedV6Pairs   []hostport6Key
 }
 
+type configFile struct {
+	InterfaceNames   []string `json:"interface_names"`
+	InterfaceRegexps []string `json:"interface_regexps"`
+	AllowAll         bool     `json:"allow_all"`
+	EnableV4         bool     `json:"enable_v4"`
+	EnableV6         bool     `json:"enable_v6"`
+	AllowedMarks     []string `json:"allowed_marks"`
+	AllowedPorts     []string `json:"allowed_ports"`
+	AllowedV4Hosts   []string `json:"allowed_v4_hosts"`
+	AllowedV6Hosts   []string `json:"allowed_v6_hosts"`
+	AllowedV4Pairs   []string `json:"allowed_v4_hostports"`
+	AllowedV6Pairs   []string `json:"allowed_v6_hostports"`
+}
+
 func main() {
-	opts, err := parseFlags(os.Args[1:])
+	configPath, err := parseArgs(os.Args[1:])
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	opts, err := loadOptions(configPath, os.Stdin)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -135,66 +143,79 @@ func main() {
 	}
 }
 
-func parseFlags(args []string) (options, error) {
-	var ifaces stringList
-	var ifaceRegexps stringList
-	var allowMarks stringList
-	var allowPorts stringList
-	var allowV4Hosts stringList
-	var allowV6Hosts stringList
-	var allowV4Hostports stringList
-	var allowV6Hostports stringList
-	opts := options{}
-
-	fs := flag.NewFlagSet("killswitch", flag.ContinueOnError)
-	fs.Var(&ifaces, "iface", "interface name to protect; may be repeated")
-	fs.Var(&ifaceRegexps, "iface-regex", "regular expression selecting interface names to protect; may be repeated")
-	fs.BoolVar(&opts.AllowAll, "allow-all", false, "pass all traffic before parsing; disables enforcement")
-	fs.BoolVar(&opts.EnableV4, "enable-v4", false, "enable IPv4 gate; traffic still drops until later allowlist phases")
-	fs.BoolVar(&opts.EnableV6, "enable-v6", false, "enable IPv6 gate; traffic still drops until later allowlist phases")
-	fs.Var(&allowMarks, "allow-mark", "allow packets with skb mark value; decimal or 0x-prefixed; may be repeated")
-	fs.Var(&allowPorts, "allow-port", "allow TCP/UDP destination port globally as tcp/443 or udp/51820; may be repeated")
-	fs.Var(&allowV4Hosts, "allow-v4-host", "allow IPv4 destination host; may be repeated")
-	fs.Var(&allowV6Hosts, "allow-v6-host", "allow IPv6 destination host; may be repeated")
-	fs.Var(&allowV4Hostports, "allow-v4-hostport", "allow IPv4 destination host and port as tcp/192.0.2.1:443; may be repeated")
-	fs.Var(&allowV6Hostports, "allow-v6-hostport", "allow IPv6 destination host and port as udp/[2001:db8::1]:51820; may be repeated")
-	fs.SetOutput(os.Stderr)
-
-	if err := fs.Parse(args); err != nil {
-		return options{}, err
+func parseArgs(args []string) (string, error) {
+	switch len(args) {
+	case 0:
+		return defaultConfigPath, nil
+	case 1:
+		return args[0], nil
+	default:
+		return "", fmt.Errorf("expected at most one config path argument, got: %s", strings.Join(args, " "))
 	}
-	if fs.NArg() != 0 {
-		return options{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
+}
+
+func loadOptions(configPath string, stdin io.Reader) (options, error) {
+	var reader io.Reader
+	if configPath == "-" {
+		log.Print("Loading config from stdin")
+		reader = stdin
+	} else {
+		log.Printf("Loading config from %s", configPath)
+		file, err := os.Open(configPath)
+		if err != nil {
+			return options{}, fmt.Errorf("open config %q: %w", configPath, err)
+		}
+		defer file.Close() //nolint:errcheck
+		reader = file
 	}
 
-	opts.InterfaceNames = ifaces
-	opts.InterfaceRegexps = ifaceRegexps
+	var cfg configFile
+	decoder := json.NewDecoder(reader)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cfg); err != nil {
+		return options{}, fmt.Errorf("decode config: %w", err)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return options{}, errors.New("decode config: multiple JSON values")
+	}
+
+	return configToOptions(cfg)
+}
+
+func configToOptions(cfg configFile) (options, error) {
+	opts := options{
+		InterfaceNames:   cfg.InterfaceNames,
+		InterfaceRegexps: cfg.InterfaceRegexps,
+		AllowAll:         cfg.AllowAll,
+		EnableV4:         cfg.EnableV4,
+		EnableV6:         cfg.EnableV6,
+	}
 	if len(opts.InterfaceNames) == 0 && len(opts.InterfaceRegexps) == 0 {
-		return options{}, errors.New("at least one -iface or -iface-regex is required")
+		return options{}, errors.New("at least one interface_names or interface_regexps entry is required")
 	}
 
 	for _, pattern := range opts.InterfaceRegexps {
 		if _, err := regexp.Compile(pattern); err != nil {
-			return options{}, fmt.Errorf("compile -iface-regex %q: %w", pattern, err)
+			return options{}, fmt.Errorf("compile interface regexp %q: %w", pattern, err)
 		}
 	}
 	var err error
-	if opts.AllowedMarks, err = policy.ParseAllowedMarks(allowMarks); err != nil {
+	if opts.AllowedMarks, err = policy.ParseAllowedMarks(cfg.AllowedMarks); err != nil {
 		return options{}, err
 	}
-	if opts.AllowedPorts, err = allowedPortKeys(allowPorts); err != nil {
+	if opts.AllowedPorts, err = allowedPortKeys(cfg.AllowedPorts); err != nil {
 		return options{}, err
 	}
-	if opts.AllowedV4Hosts, err = allowedV4HostKeys(allowV4Hosts); err != nil {
+	if opts.AllowedV4Hosts, err = allowedV4HostKeys(cfg.AllowedV4Hosts); err != nil {
 		return options{}, err
 	}
-	if opts.AllowedV6Hosts, err = allowedV6HostKeys(allowV6Hosts); err != nil {
+	if opts.AllowedV6Hosts, err = allowedV6HostKeys(cfg.AllowedV6Hosts); err != nil {
 		return options{}, err
 	}
-	if opts.AllowedV4Pairs, err = allowedV4HostportKeys(allowV4Hostports); err != nil {
+	if opts.AllowedV4Pairs, err = allowedV4HostportKeys(cfg.AllowedV4Pairs); err != nil {
 		return options{}, err
 	}
-	if opts.AllowedV6Pairs, err = allowedV6HostportKeys(allowV6Hostports); err != nil {
+	if opts.AllowedV6Pairs, err = allowedV6HostportKeys(cfg.AllowedV6Pairs); err != nil {
 		return options{}, err
 	}
 

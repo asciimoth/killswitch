@@ -1,7 +1,7 @@
 package main
 
-import "fmt"
+import "log"
 
 func main() {
-	fmt.Println("killswitch-cli stub")
+	log.Print("killswitch-cli stub")
 }

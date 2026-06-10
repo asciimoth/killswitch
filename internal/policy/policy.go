@@ -28,7 +28,7 @@ func ParseAllowedMarks(values []string) ([]uint32, error) {
 	for _, value := range values {
 		parsed, err := strconv.ParseUint(value, 0, 32)
 		if err != nil {
-			return nil, fmt.Errorf("parse -allow-mark %q: %w", value, err)
+			return nil, fmt.Errorf("parse allowed_marks %q: %w", value, err)
 		}
 		out = append(out, uint32(parsed))
 	}
@@ -40,7 +40,7 @@ func ParseAllowedPorts(values []string) ([]PortRule, error) {
 	for _, value := range values {
 		protocol, port, err := parseProtocolPort(value)
 		if err != nil {
-			return nil, fmt.Errorf("parse -allow-port %q: %w", value, err)
+			return nil, fmt.Errorf("parse allowed_ports %q: %w", value, err)
 		}
 		out = append(out, PortRule{Protocol: protocol, Port: port})
 	}
@@ -52,10 +52,10 @@ func ParseAllowedV4Hosts(values []string) ([]netip.Addr, error) {
 	for _, value := range values {
 		addr, err := parseAddr(value)
 		if err != nil {
-			return nil, fmt.Errorf("parse -allow-v4-host %q: %w", value, err)
+			return nil, fmt.Errorf("parse allowed_v4_hosts %q: %w", value, err)
 		}
 		if !addr.Is4() {
-			return nil, fmt.Errorf("parse -allow-v4-host %q: address is not IPv4", value)
+			return nil, fmt.Errorf("parse allowed_v4_hosts %q: address is not IPv4", value)
 		}
 		out = append(out, addr)
 	}
@@ -67,10 +67,10 @@ func ParseAllowedV6Hosts(values []string) ([]netip.Addr, error) {
 	for _, value := range values {
 		addr, err := parseAddr(value)
 		if err != nil {
-			return nil, fmt.Errorf("parse -allow-v6-host %q: %w", value, err)
+			return nil, fmt.Errorf("parse allowed_v6_hosts %q: %w", value, err)
 		}
 		if !addr.Is6() || addr.Is4In6() {
-			return nil, fmt.Errorf("parse -allow-v6-host %q: address is not IPv6", value)
+			return nil, fmt.Errorf("parse allowed_v6_hosts %q: address is not IPv6", value)
 		}
 		out = append(out, addr)
 	}
@@ -82,10 +82,10 @@ func ParseAllowedV4Hostports(values []string) ([]HostPortRule, error) {
 	for _, value := range values {
 		rule, err := parseProtocolAddrPort(value)
 		if err != nil {
-			return nil, fmt.Errorf("parse -allow-v4-hostport %q: %w", value, err)
+			return nil, fmt.Errorf("parse allowed_v4_hostports %q: %w", value, err)
 		}
 		if !rule.AddrPort.Addr().Is4() {
-			return nil, fmt.Errorf("parse -allow-v4-hostport %q: address is not IPv4", value)
+			return nil, fmt.Errorf("parse allowed_v4_hostports %q: address is not IPv4", value)
 		}
 		out = append(out, rule)
 	}
@@ -97,10 +97,10 @@ func ParseAllowedV6Hostports(values []string) ([]HostPortRule, error) {
 	for _, value := range values {
 		rule, err := parseProtocolAddrPort(value)
 		if err != nil {
-			return nil, fmt.Errorf("parse -allow-v6-hostport %q: %w", value, err)
+			return nil, fmt.Errorf("parse allowed_v6_hostports %q: %w", value, err)
 		}
 		if !rule.AddrPort.Addr().Is6() || rule.AddrPort.Addr().Is4In6() {
-			return nil, fmt.Errorf("parse -allow-v6-hostport %q: address is not IPv6", value)
+			return nil, fmt.Errorf("parse allowed_v6_hostports %q: address is not IPv6", value)
 		}
 		out = append(out, rule)
 	}
