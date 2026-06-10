@@ -102,33 +102,39 @@ type hostport6Key struct {
 }
 
 type options struct {
-	InterfaceTypes   []string
-	InterfaceNames   []string
-	InterfaceRegexps []string
-	AllowAll         bool
-	EnableV4         bool
-	EnableV6         bool
-	AllowedMarks     []uint32
-	AllowedPorts     []portKey
-	AllowedV4Hosts   []uint32
-	AllowedV6Hosts   []ipv6AddrKey
-	AllowedV4Pairs   []hostport4Key
-	AllowedV6Pairs   []hostport6Key
+	InterfaceTypes          []string
+	InterfaceNames          []string
+	InterfaceRegexps        []string
+	IgnoredInterfaceTypes   []string
+	IgnoredInterfaceNames   []string
+	IgnoredInterfaceRegexps []string
+	AllowAll                bool
+	EnableV4                bool
+	EnableV6                bool
+	AllowedMarks            []uint32
+	AllowedPorts            []portKey
+	AllowedV4Hosts          []uint32
+	AllowedV6Hosts          []ipv6AddrKey
+	AllowedV4Pairs          []hostport4Key
+	AllowedV6Pairs          []hostport6Key
 }
 
 type configFile struct {
-	InterfaceTypes   []string `json:"interface_types"`
-	InterfaceNames   []string `json:"interface_names"`
-	InterfaceRegexps []string `json:"interface_regexps"`
-	AllowAll         bool     `json:"allow_all"`
-	EnableV4         bool     `json:"enable_v4"`
-	EnableV6         bool     `json:"enable_v6"`
-	AllowedMarks     []string `json:"allowed_marks"`
-	AllowedPorts     []string `json:"allowed_ports"`
-	AllowedV4Hosts   []string `json:"allowed_v4_hosts"`
-	AllowedV6Hosts   []string `json:"allowed_v6_hosts"`
-	AllowedV4Pairs   []string `json:"allowed_v4_hostports"`
-	AllowedV6Pairs   []string `json:"allowed_v6_hostports"`
+	InterfaceTypes          []string `json:"interface_types"`
+	InterfaceNames          []string `json:"interface_names"`
+	InterfaceRegexps        []string `json:"interface_regexps"`
+	IgnoredInterfaceTypes   []string `json:"ignored_interface_types"`
+	IgnoredInterfaceNames   []string `json:"ignored_interface_names"`
+	IgnoredInterfaceRegexps []string `json:"ignored_interface_regexps"`
+	AllowAll                bool     `json:"allow_all"`
+	EnableV4                bool     `json:"enable_v4"`
+	EnableV6                bool     `json:"enable_v6"`
+	AllowedMarks            []string `json:"allowed_marks"`
+	AllowedPorts            []string `json:"allowed_ports"`
+	AllowedV4Hosts          []string `json:"allowed_v4_hosts"`
+	AllowedV6Hosts          []string `json:"allowed_v6_hosts"`
+	AllowedV4Pairs          []string `json:"allowed_v4_hostports"`
+	AllowedV6Pairs          []string `json:"allowed_v6_hostports"`
 }
 
 type interfaceInfo struct {
@@ -204,12 +210,15 @@ func loadOptions(configPath string, stdin io.Reader) (options, error) {
 
 func configToOptions(cfg configFile) (options, error) {
 	opts := options{
-		InterfaceTypes:   cfg.InterfaceTypes,
-		InterfaceNames:   cfg.InterfaceNames,
-		InterfaceRegexps: cfg.InterfaceRegexps,
-		AllowAll:         cfg.AllowAll,
-		EnableV4:         cfg.EnableV4,
-		EnableV6:         cfg.EnableV6,
+		InterfaceTypes:          cfg.InterfaceTypes,
+		InterfaceNames:          cfg.InterfaceNames,
+		InterfaceRegexps:        cfg.InterfaceRegexps,
+		IgnoredInterfaceTypes:   cfg.IgnoredInterfaceTypes,
+		IgnoredInterfaceNames:   cfg.IgnoredInterfaceNames,
+		IgnoredInterfaceRegexps: cfg.IgnoredInterfaceRegexps,
+		AllowAll:                cfg.AllowAll,
+		EnableV4:                cfg.EnableV4,
+		EnableV6:                cfg.EnableV6,
 	}
 	if len(opts.InterfaceTypes) == 0 && len(opts.InterfaceNames) == 0 && len(opts.InterfaceRegexps) == 0 {
 		return options{}, errors.New("at least one interface_types, interface_names, or interface_regexps entry is required")
@@ -218,6 +227,11 @@ func configToOptions(cfg configFile) (options, error) {
 	for _, pattern := range opts.InterfaceRegexps {
 		if _, err := regexp.Compile(pattern); err != nil {
 			return options{}, fmt.Errorf("compile interface regexp %q: %w", pattern, err)
+		}
+	}
+	for _, pattern := range opts.IgnoredInterfaceRegexps {
+		if _, err := regexp.Compile(pattern); err != nil {
+			return options{}, fmt.Errorf("compile ignored interface regexp %q: %w", pattern, err)
 		}
 	}
 	var err error
@@ -350,40 +364,14 @@ func listInterfaces() ([]interfaceInfo, error) {
 }
 
 func selectInterfaces(all []interfaceInfo, opts options) ([]interfaceInfo, error) {
-	types := make(map[string]struct{}, len(opts.InterfaceTypes))
-	for _, typ := range opts.InterfaceTypes {
-		types[typ] = struct{}{}
-	}
-
-	names := make(map[string]struct{}, len(opts.InterfaceNames))
-	for _, name := range opts.InterfaceNames {
-		names[name] = struct{}{}
-	}
-
-	regexps := make([]*regexp.Regexp, 0, len(opts.InterfaceRegexps))
-	for _, pattern := range opts.InterfaceRegexps {
-		re, err := regexp.Compile(pattern)
-		if err != nil {
-			return nil, fmt.Errorf("compile interface regexp %q: %w", pattern, err)
-		}
-		regexps = append(regexps, re)
-	}
-
 	var selected []interfaceInfo
 	for _, iface := range all {
-		if _, ok := types[iface.Type]; ok {
-			selected = append(selected, iface)
-			continue
+		matches, err := interfaceMatchesSelectors(iface, opts)
+		if err != nil {
+			return nil, err
 		}
-		if _, ok := names[iface.Name]; ok {
+		if matches {
 			selected = append(selected, iface)
-			continue
-		}
-		for _, re := range regexps {
-			if re.MatchString(iface.Name) {
-				selected = append(selected, iface)
-				break
-			}
 		}
 	}
 
@@ -746,6 +734,14 @@ func (m *egressManager) isAttached(index int) bool {
 }
 
 func interfaceMatchesSelectors(iface interfaceInfo, opts options) (bool, error) {
+	ignored, err := interfaceMatchesIgnoreSelectors(iface, opts)
+	if err != nil {
+		return false, err
+	}
+	if ignored {
+		return false, nil
+	}
+
 	for _, typ := range opts.InterfaceTypes {
 		if iface.Type == typ {
 			return true, nil
@@ -760,6 +756,32 @@ func interfaceMatchesSelectors(iface interfaceInfo, opts options) (bool, error) 
 		matches, err := regexp.MatchString(pattern, iface.Name)
 		if err != nil {
 			return false, fmt.Errorf("compile interface regexp %q: %w", pattern, err)
+		}
+		if matches {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func interfaceMatchesIgnoreSelectors(iface interfaceInfo, opts options) (bool, error) {
+	if iface.Name == "lo" {
+		return true, nil
+	}
+	for _, typ := range opts.IgnoredInterfaceTypes {
+		if iface.Type == typ {
+			return true, nil
+		}
+	}
+	for _, name := range opts.IgnoredInterfaceNames {
+		if iface.Name == name {
+			return true, nil
+		}
+	}
+	for _, pattern := range opts.IgnoredInterfaceRegexps {
+		matches, err := regexp.MatchString(pattern, iface.Name)
+		if err != nil {
+			return false, fmt.Errorf("compile ignored interface regexp %q: %w", pattern, err)
 		}
 		if matches {
 			return true, nil

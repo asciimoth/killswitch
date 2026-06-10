@@ -56,6 +56,9 @@ func TestLoadOptionsFromStdin(t *testing.T) {
 		"interface_types": ["device"],
 		"interface_names": ["eth0", "wlan0"],
 		"interface_regexps": ["^en"],
+		"ignored_interface_types": ["bridge"],
+		"ignored_interface_names": ["veth0"],
+		"ignored_interface_regexps": ["^docker"],
 		"allow_all": true,
 		"enable_v4": true,
 		"allowed_marks": ["0x42"],
@@ -74,17 +77,20 @@ func TestLoadOptionsFromStdin(t *testing.T) {
 
 func TestConfigToOptions(t *testing.T) {
 	opts, err := configToOptions(configFile{
-		InterfaceTypes:   []string{"device"},
-		InterfaceNames:   []string{"eth0", "wlan0"},
-		InterfaceRegexps: []string{"^en"},
-		AllowAll:         true,
-		EnableV4:         true,
-		AllowedMarks:     []string{"0x42"},
-		AllowedPorts:     []string{"udp/51820"},
-		AllowedV4Hosts:   []string{"192.0.2.10"},
-		AllowedV6Hosts:   []string{"2001:db8::10"},
-		AllowedV4Pairs:   []string{"tcp/198.51.100.20:443"},
-		AllowedV6Pairs:   []string{"udp/[2001:db8::20]:51820"},
+		InterfaceTypes:          []string{"device"},
+		InterfaceNames:          []string{"eth0", "wlan0"},
+		InterfaceRegexps:        []string{"^en"},
+		IgnoredInterfaceTypes:   []string{"bridge"},
+		IgnoredInterfaceNames:   []string{"veth0"},
+		IgnoredInterfaceRegexps: []string{"^docker"},
+		AllowAll:                true,
+		EnableV4:                true,
+		AllowedMarks:            []string{"0x42"},
+		AllowedPorts:            []string{"udp/51820"},
+		AllowedV4Hosts:          []string{"192.0.2.10"},
+		AllowedV6Hosts:          []string{"2001:db8::10"},
+		AllowedV4Pairs:          []string{"tcp/198.51.100.20:443"},
+		AllowedV6Pairs:          []string{"udp/[2001:db8::20]:51820"},
 	})
 	if err != nil {
 		t.Fatalf("config to options: %v", err)
@@ -104,6 +110,15 @@ func assertParsedOptions(t *testing.T, opts options) {
 	}
 	if got := strings.Join(opts.InterfaceRegexps, ","); got != "^en" {
 		t.Fatalf("interface regexps = %q", got)
+	}
+	if got := strings.Join(opts.IgnoredInterfaceNames, ","); got != "veth0" {
+		t.Fatalf("ignored interface names = %q", got)
+	}
+	if got := strings.Join(opts.IgnoredInterfaceTypes, ","); got != "bridge" {
+		t.Fatalf("ignored interface types = %q", got)
+	}
+	if got := strings.Join(opts.IgnoredInterfaceRegexps, ","); got != "^docker" {
+		t.Fatalf("ignored interface regexps = %q", got)
 	}
 	if !opts.AllowAll || !opts.EnableV4 || opts.EnableV6 {
 		t.Fatalf("unexpected bool flags: %+v", opts)
@@ -136,6 +151,18 @@ func TestParseAllowlistValidation(t *testing.T) {
 		{InterfaceNames: []string{"eth0"}, AllowedV6Hosts: []string{"192.0.2.1"}},
 		{InterfaceNames: []string{"eth0"}, AllowedV4Pairs: []string{"udp/[2001:db8::1]:53"}},
 		{InterfaceNames: []string{"eth0"}, AllowedV6Pairs: []string{"udp/192.0.2.1:53"}},
+	}
+
+	for _, cfg := range tests {
+		if _, err := configToOptions(cfg); err == nil {
+			t.Fatalf("configToOptions(%+v) succeeded, expected error", cfg)
+		}
+	}
+}
+
+func TestParseIgnoredInterfaceRegexpValidation(t *testing.T) {
+	tests := []configFile{
+		{InterfaceNames: []string{"eth0"}, IgnoredInterfaceRegexps: []string{"["}},
 	}
 
 	for _, cfg := range tests {
@@ -186,6 +213,50 @@ func TestSelectInterfacesByLiteralType(t *testing.T) {
 	}
 }
 
+func TestSelectInterfacesAlwaysIgnoresLoopback(t *testing.T) {
+	all := []interfaceInfo{
+		{Name: "lo", Index: 1, Type: "device"},
+		{Name: "eth0", Index: 2, Type: "device"},
+	}
+	opts := options{
+		InterfaceTypes: []string{"device"},
+	}
+
+	selected, err := selectInterfaces(all, opts)
+	if err != nil {
+		t.Fatalf("select interfaces: %v", err)
+	}
+
+	if got := interfaceNames(selected); got != "eth0" {
+		t.Fatalf("selected interfaces = %q", got)
+	}
+}
+
+func TestSelectInterfacesIgnoreRulesOverrideIncludes(t *testing.T) {
+	all := []interfaceInfo{
+		{Name: "br0", Index: 1, Type: "bridge"},
+		{Name: "eth0", Index: 2, Type: "device"},
+		{Name: "docker0", Index: 3, Type: "device"},
+		{Name: "wlan0", Index: 4, Type: "device"},
+	}
+	opts := options{
+		InterfaceTypes:          []string{"bridge", "device"},
+		InterfaceRegexps:        []string{"^docker"},
+		IgnoredInterfaceTypes:   []string{"bridge"},
+		IgnoredInterfaceNames:   []string{"eth0"},
+		IgnoredInterfaceRegexps: []string{"^docker"},
+	}
+
+	selected, err := selectInterfaces(all, opts)
+	if err != nil {
+		t.Fatalf("select interfaces: %v", err)
+	}
+
+	if got := interfaceNames(selected); got != "wlan0" {
+		t.Fatalf("selected interfaces = %q", got)
+	}
+}
+
 func TestShouldReconcileLinkUpdateIgnoresUnchangedSelectedInterface(t *testing.T) {
 	manager := newEgressManager(nil)
 	manager.attached[4] = attachedInterface{info: interfaceInfo{Name: "wlp0s20f3", Index: 4, Type: "device"}}
@@ -211,6 +282,17 @@ func TestShouldReconcileLinkUpdateAllowsAttachAndDetachEvents(t *testing.T) {
 		InterfaceRegexps: []string{"^wl"},
 	}) {
 		t.Fatal("expected deleted attached interface to trigger reconcile")
+	}
+}
+
+func TestShouldReconcileLinkUpdateIgnoresIgnoredInterface(t *testing.T) {
+	manager := newEgressManager(nil)
+
+	if manager.shouldReconcileLinkUpdate(linkUpdate(unix.RTM_NEWLINK, 5, "docker0", "device"), options{
+		InterfaceTypes:          []string{"device"},
+		IgnoredInterfaceRegexps: []string{"^docker"},
+	}) {
+		t.Fatal("expected ignored matching interface update to be ignored")
 	}
 }
 

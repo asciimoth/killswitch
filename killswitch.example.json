@@ -9,6 +9,15 @@
   "interface_regexps": [
     "^(en|wl|ww)"
   ],
+  "ignored_interface_types": [
+    "bridge"
+  ],
+  "ignored_interface_names": [
+    "docker0"
+  ],
+  "ignored_interface_regexps": [
+    "^(veth|br-)"
+  ],
   "allow_all": false,
   "enable_v4": true,
   "enable_v6": true,
