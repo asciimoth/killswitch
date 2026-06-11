@@ -52,6 +52,7 @@ type adminAPIAuthRules struct {
 type adminAPIServer struct {
 	opts           adminAPIOptions
 	configSnapshot func() adminapi.CurrentConfig
+	mutateConfig   func(adminapi.MutationRequest) adminapi.MutationResult
 }
 
 type adminAPIPeer struct {
@@ -99,11 +100,16 @@ func validateAdminAPIOptions(opts adminAPIOptions) error {
 	return nil
 }
 
-func newAdminAPIServer(opts adminAPIOptions, configSnapshot func() adminapi.CurrentConfig) *adminAPIServer {
+func newAdminAPIServer(opts adminAPIOptions, configSnapshot func() adminapi.CurrentConfig, mutateConfig func(adminapi.MutationRequest) adminapi.MutationResult) *adminAPIServer {
 	if configSnapshot == nil {
 		configSnapshot = func() adminapi.CurrentConfig { return adminapi.CurrentConfig{} }
 	}
-	return &adminAPIServer{opts: opts, configSnapshot: configSnapshot}
+	if mutateConfig == nil {
+		mutateConfig = func(adminapi.MutationRequest) adminapi.MutationResult {
+			return adminapi.MutationResult{OK: false, Error: "mutations are not available", Config: configSnapshot()}
+		}
+	}
+	return &adminAPIServer{opts: opts, configSnapshot: configSnapshot, mutateConfig: mutateConfig}
 }
 
 func (s *adminAPIServer) listenAndServe(ctx context.Context) error {
@@ -252,10 +258,21 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 			return
 		}
 
-		switch msg.(type) {
+		switch msg := msg.(type) {
 		case adminapi.ConfigRequest:
 			if err := adminapi.WriteMessage(encoder, adminapi.ConfigMessage{Config: s.configSnapshot()}); err != nil {
 				log.Printf("Admin API write config for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, err)
+				return
+			}
+		case adminapi.MutationRequest:
+			result := s.mutateConfig(msg)
+			if !result.OK {
+				log.Printf("Admin API rejected mutation for pid=%d uid=%d gid=%d op=%s target=%s ruleset=%s: %s", peer.PID, peer.UID, peer.GID, msg.Operation, msg.Target, msg.Ruleset, result.Error)
+			} else if result.Changed {
+				log.Printf("Admin API applied mutation for pid=%d uid=%d gid=%d op=%s target=%s ruleset=%s", peer.PID, peer.UID, peer.GID, msg.Operation, msg.Target, msg.Ruleset)
+			}
+			if err := adminapi.WriteMessage(encoder, result); err != nil {
+				log.Printf("Admin API write mutation result for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, err)
 				return
 			}
 		case adminapi.UnknownMessage:

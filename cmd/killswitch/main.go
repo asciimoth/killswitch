@@ -428,6 +428,478 @@ func allowRulesFromConfig(cfg rulesetConfig) (allowRules, error) {
 	return rules, nil
 }
 
+func applyAdminMutation(req adminapi.MutationRequest, policies *policyManager, manager *egressManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
+	reconcileMu.Lock()
+	defer reconcileMu.Unlock()
+
+	next, err := mutateOptions(policies.optionsSnapshot(), req)
+	if err != nil {
+		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
+	}
+
+	policies.replaceOptions(next)
+	if _, err := manager.reconcileCurrent(next, false); err != nil {
+		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
+	}
+	changed, err := policies.reconcileCurrent(true)
+	if err != nil {
+		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
+	}
+	return adminapi.MutationResult{OK: true, Changed: changed, Config: policies.configSnapshot()}
+}
+
+func mutateOptions(opts options, req adminapi.MutationRequest) (options, error) {
+	next := cloneOptions(opts)
+	if strings.HasPrefix(req.Target, "admin_api") || req.Target == "admin_api" {
+		return options{}, errors.New("admin_api configuration cannot be mutated via admin API")
+	}
+	switch req.Operation {
+	case adminapi.MutationAdd, adminapi.MutationRemove, adminapi.MutationSet:
+	default:
+		return options{}, fmt.Errorf("unsupported mutation operation %q", req.Operation)
+	}
+	if req.Target == "" {
+		return options{}, errors.New("mutation target is required")
+	}
+
+	switch req.Target {
+	case "interface_types":
+		if err := mutateStringList(&next.InterfaceTypes, req); err != nil {
+			return options{}, err
+		}
+	case "interface_names":
+		if err := mutateStringList(&next.InterfaceNames, req); err != nil {
+			return options{}, err
+		}
+	case "interface_regexps":
+		if err := mutateStringList(&next.InterfaceRegexps, req); err != nil {
+			return options{}, err
+		}
+		if err := validateRegexps("interface_regexps", next.InterfaceRegexps); err != nil {
+			return options{}, err
+		}
+	case "ignored_interface_types":
+		if err := mutateStringList(&next.IgnoredInterfaceTypes, req); err != nil {
+			return options{}, err
+		}
+	case "ignored_interface_names":
+		if err := mutateStringList(&next.IgnoredInterfaceNames, req); err != nil {
+			return options{}, err
+		}
+	case "ignored_interface_regexps":
+		if err := mutateStringList(&next.IgnoredInterfaceRegexps, req); err != nil {
+			return options{}, err
+		}
+		if err := validateRegexps("ignored_interface_regexps", next.IgnoredInterfaceRegexps); err != nil {
+			return options{}, err
+		}
+	case "base_policy":
+		if req.Operation != adminapi.MutationSet {
+			return options{}, errors.New("base_policy only supports set")
+		}
+		rules, err := allowRulesFromAPI(req.Policy, req.Value)
+		if err != nil {
+			return options{}, err
+		}
+		next.allowRules = rules
+	case "ruleset":
+		if err := mutateWholeRuleset(&next.Rulesets, req); err != nil {
+			return options{}, err
+		}
+	default:
+		if strings.HasPrefix(req.Target, "base_policy.") {
+			if err := mutateAllowRulesField(&next.allowRules, strings.TrimPrefix(req.Target, "base_policy."), req); err != nil {
+				return options{}, err
+			}
+		} else if strings.HasPrefix(req.Target, "ruleset.") {
+			if err := mutateRulesetField(&next.Rulesets, strings.TrimPrefix(req.Target, "ruleset."), req); err != nil {
+				return options{}, err
+			}
+		} else {
+			return options{}, fmt.Errorf("unsupported mutation target %q", req.Target)
+		}
+	}
+
+	if len(next.InterfaceTypes) == 0 && len(next.InterfaceNames) == 0 && len(next.InterfaceRegexps) == 0 {
+		return options{}, errors.New("at least one interface_types, interface_names, or interface_regexps entry is required")
+	}
+	return next, nil
+}
+
+func mutateStringList(dst *[]string, req adminapi.MutationRequest) error {
+	values, err := mutationStringValues(req)
+	if err != nil {
+		return err
+	}
+	switch req.Operation {
+	case adminapi.MutationAdd:
+		*dst = uniqueStrings(append(*dst, values...))
+	case adminapi.MutationRemove:
+		*dst = removeStrings(*dst, values)
+	case adminapi.MutationSet:
+		*dst = uniqueStrings(values)
+	}
+	return nil
+}
+
+func mutationStringValues(req adminapi.MutationRequest) ([]string, error) {
+	if len(req.Values) > 0 {
+		return cloneStrings(req.Values), nil
+	}
+	if len(req.Value) == 0 {
+		return nil, errors.New("mutation values are required")
+	}
+	var values []string
+	if err := json.Unmarshal(req.Value, &values); err == nil {
+		return values, nil
+	}
+	var value string
+	if err := json.Unmarshal(req.Value, &value); err != nil {
+		return nil, fmt.Errorf("decode mutation value as string or string array: %w", err)
+	}
+	return []string{value}, nil
+}
+
+func mutateAllowRulesField(rules *allowRules, field string, req adminapi.MutationRequest) error {
+	switch field {
+	case "allow_all":
+		return mutateBool(&rules.AllowAll, req)
+	case "enable_v4":
+		return mutateBool(&rules.EnableV4, req)
+	case "enable_v6":
+		return mutateBool(&rules.EnableV6, req)
+	case "allowed_marks", "allowed_ports", "allowed_v4_hosts", "allowed_v6_hosts", "allowed_v4_hostports", "allowed_v6_hostports":
+		api := apiAllowRules(*rules)
+		if err := mutateAPIAllowRulesField(&api, field, req); err != nil {
+			return err
+		}
+		parsed, err := allowRulesFromAPI(&api, nil)
+		if err != nil {
+			return err
+		}
+		*rules = parsed
+		return nil
+	default:
+		return fmt.Errorf("unsupported allow rules field %q", field)
+	}
+}
+
+func mutateAPIAllowRulesField(rules *adminapi.AllowRules, field string, req adminapi.MutationRequest) error {
+	switch field {
+	case "allowed_marks":
+		return mutateStringList(&rules.AllowedMarks, req)
+	case "allowed_ports":
+		return mutateStringList(&rules.AllowedPorts, req)
+	case "allowed_v4_hosts":
+		return mutateStringList(&rules.AllowedV4Hosts, req)
+	case "allowed_v6_hosts":
+		return mutateStringList(&rules.AllowedV6Hosts, req)
+	case "allowed_v4_hostports":
+		return mutateStringList(&rules.AllowedV4Pairs, req)
+	case "allowed_v6_hostports":
+		return mutateStringList(&rules.AllowedV6Pairs, req)
+	default:
+		return fmt.Errorf("unsupported allow rules field %q", field)
+	}
+}
+
+func mutateBool(dst *bool, req adminapi.MutationRequest) error {
+	if req.Operation != adminapi.MutationSet {
+		return errors.New("boolean fields only support set")
+	}
+	if len(req.Value) == 0 {
+		return errors.New("boolean mutation value is required")
+	}
+	var value bool
+	if err := json.Unmarshal(req.Value, &value); err != nil {
+		return fmt.Errorf("decode boolean mutation value: %w", err)
+	}
+	*dst = value
+	return nil
+}
+
+func mutateWholeRuleset(rulesets *[]ruleset, req adminapi.MutationRequest) error {
+	if req.Ruleset == "" {
+		return errors.New("ruleset name is required")
+	}
+	switch req.Operation {
+	case adminapi.MutationRemove:
+		*rulesets = removeRuleset(*rulesets, req.Ruleset)
+		return nil
+	case adminapi.MutationAdd, adminapi.MutationSet:
+		rulesetDef, err := rulesetFromAPI(req.Ruleset, req.RulesetDef, req.Value)
+		if err != nil {
+			return err
+		}
+		if req.Operation == adminapi.MutationAdd && findRuleset(*rulesets, req.Ruleset) >= 0 {
+			return fmt.Errorf("ruleset %q already exists", req.Ruleset)
+		}
+		upsertRuleset(rulesets, rulesetDef)
+		return nil
+	default:
+		return fmt.Errorf("unsupported ruleset operation %q", req.Operation)
+	}
+}
+
+func mutateRulesetField(rulesets *[]ruleset, field string, req adminapi.MutationRequest) error {
+	if req.Ruleset == "" {
+		return errors.New("ruleset name is required")
+	}
+	idx := findRuleset(*rulesets, req.Ruleset)
+	if idx < 0 {
+		return fmt.Errorf("ruleset %q does not exist", req.Ruleset)
+	}
+	rs := (*rulesets)[idx]
+	switch field {
+	case "priority":
+		if req.Operation != adminapi.MutationSet {
+			return errors.New("ruleset priority only supports set")
+		}
+		var priority int
+		if len(req.Value) == 0 {
+			return errors.New("ruleset priority value is required")
+		}
+		if err := json.Unmarshal(req.Value, &priority); err != nil {
+			return fmt.Errorf("decode ruleset priority: %w", err)
+		}
+		rs.Priority = priority
+	case "match_all":
+		if err := mutateBool(&rs.MatchAll, req); err != nil {
+			return err
+		}
+	case "trigger.interface_types":
+		if err := mutateStringList(&rs.Trigger.InterfaceTypes, req); err != nil {
+			return err
+		}
+	case "trigger.interface_names":
+		if err := mutateStringList(&rs.Trigger.InterfaceNames, req); err != nil {
+			return err
+		}
+	case "trigger.interface_regexps":
+		if err := mutateStringList(&rs.Trigger.InterfaceRegexps, req); err != nil {
+			return err
+		}
+		if err := validateRegexps("ruleset trigger interface_regexps", rs.Trigger.InterfaceRegexps); err != nil {
+			return err
+		}
+	case "trigger.ip_addrs":
+		apiTrigger := adminapi.RulesetTrigger{IPAddrs: apiAddrs(rs.Trigger.IPAddrs)}
+		if err := mutateStringList(&apiTrigger.IPAddrs, req); err != nil {
+			return err
+		}
+		trigger, err := triggerFromConfig(triggerConfig{
+			InterfaceTypes:   rs.Trigger.InterfaceTypes,
+			InterfaceNames:   rs.Trigger.InterfaceNames,
+			InterfaceRegexps: rs.Trigger.InterfaceRegexps,
+			IPAddrs:          apiTrigger.IPAddrs,
+		})
+		if err != nil {
+			return err
+		}
+		rs.Trigger = trigger
+	case "policy.allow_all", "policy.enable_v4", "policy.enable_v6",
+		"policy.allowed_marks", "policy.allowed_ports", "policy.allowed_v4_hosts",
+		"policy.allowed_v6_hosts", "policy.allowed_v4_hostports", "policy.allowed_v6_hostports":
+		if err := mutateAllowRulesField(&rs.allowRules, strings.TrimPrefix(field, "policy."), req); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported ruleset field %q", field)
+	}
+	if len(rs.Trigger.InterfaceTypes) == 0 && len(rs.Trigger.InterfaceNames) == 0 && len(rs.Trigger.InterfaceRegexps) == 0 && len(rs.Trigger.IPAddrs) == 0 {
+		return errors.New("trigger requires at least one interface_types, interface_names, interface_regexps, or ip_addrs entry")
+	}
+	(*rulesets)[idx] = rs
+	sortRulesets(*rulesets)
+	return nil
+}
+
+func allowRulesFromAPI(policyPtr *adminapi.AllowRules, raw json.RawMessage) (allowRules, error) {
+	var policy adminapi.AllowRules
+	if policyPtr != nil {
+		policy = *policyPtr
+	} else {
+		if len(raw) == 0 {
+			return allowRules{}, errors.New("allow rules value is required")
+		}
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&policy); err != nil {
+			return allowRules{}, fmt.Errorf("decode allow rules: %w", err)
+		}
+		if decoder.Decode(&struct{}{}) != io.EOF {
+			return allowRules{}, errors.New("decode allow rules: multiple JSON values")
+		}
+	}
+	return allowRulesFromConfig(rulesetConfig{
+		AllowAll:       policy.AllowAll,
+		EnableV4:       policy.EnableV4,
+		EnableV6:       policy.EnableV6,
+		AllowedMarks:   policy.AllowedMarks,
+		AllowedPorts:   policy.AllowedPorts,
+		AllowedV4Hosts: policy.AllowedV4Hosts,
+		AllowedV6Hosts: policy.AllowedV6Hosts,
+		AllowedV4Pairs: policy.AllowedV4Pairs,
+		AllowedV6Pairs: policy.AllowedV6Pairs,
+	})
+}
+
+func rulesetFromAPI(name string, rulesetPtr *adminapi.RulesetMutation, raw json.RawMessage) (ruleset, error) {
+	var api adminapi.RulesetMutation
+	if rulesetPtr != nil {
+		api = *rulesetPtr
+	} else {
+		if len(raw) == 0 {
+			return ruleset{}, errors.New("ruleset value is required")
+		}
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&api); err != nil {
+			return ruleset{}, fmt.Errorf("decode ruleset: %w", err)
+		}
+		if decoder.Decode(&struct{}{}) != io.EOF {
+			return ruleset{}, errors.New("decode ruleset: multiple JSON values")
+		}
+	}
+
+	trigger, err := triggerFromConfig(triggerConfig{
+		InterfaceTypes:   api.Trigger.InterfaceTypes,
+		InterfaceNames:   api.Trigger.InterfaceNames,
+		InterfaceRegexps: api.Trigger.InterfaceRegexps,
+		IPAddrs:          api.Trigger.IPAddrs,
+	})
+	if err != nil {
+		return ruleset{}, err
+	}
+	rules, err := allowRulesFromAPI(&api.Policy, nil)
+	if err != nil {
+		return ruleset{}, err
+	}
+	return ruleset{Name: name, Priority: api.Priority, MatchAll: api.MatchAll, Trigger: trigger, allowRules: rules}, nil
+}
+
+func validateRegexps(field string, values []string) error {
+	for _, pattern := range values {
+		if _, err := regexp.Compile(pattern); err != nil {
+			return fmt.Errorf("compile %s %q: %w", field, pattern, err)
+		}
+	}
+	return nil
+}
+
+func uniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(values))
+	out := values[:0]
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return append([]string(nil), out...)
+}
+
+func removeStrings(values, remove []string) []string {
+	removeSet := make(map[string]bool, len(remove))
+	for _, value := range remove {
+		removeSet[value] = true
+	}
+	out := values[:0]
+	for _, value := range values {
+		if !removeSet[value] {
+			out = append(out, value)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return append([]string(nil), out...)
+}
+
+func findRuleset(rulesets []ruleset, name string) int {
+	for i, rs := range rulesets {
+		if rs.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func removeRuleset(rulesets []ruleset, name string) []ruleset {
+	idx := findRuleset(rulesets, name)
+	if idx < 0 {
+		return append([]ruleset(nil), rulesets...)
+	}
+	out := append([]ruleset(nil), rulesets[:idx]...)
+	out = append(out, rulesets[idx+1:]...)
+	return out
+}
+
+func upsertRuleset(rulesets *[]ruleset, rs ruleset) {
+	idx := findRuleset(*rulesets, rs.Name)
+	if idx < 0 {
+		*rulesets = append(*rulesets, rs)
+	} else {
+		(*rulesets)[idx] = rs
+	}
+	sortRulesets(*rulesets)
+}
+
+func sortRulesets(rulesets []ruleset) {
+	sort.Slice(rulesets, func(i, j int) bool {
+		return rulesets[i].Name < rulesets[j].Name
+	})
+}
+
+func cloneOptions(opts options) options {
+	out := opts
+	out.InterfaceTypes = cloneStrings(opts.InterfaceTypes)
+	out.InterfaceNames = cloneStrings(opts.InterfaceNames)
+	out.InterfaceRegexps = cloneStrings(opts.InterfaceRegexps)
+	out.IgnoredInterfaceTypes = cloneStrings(opts.IgnoredInterfaceTypes)
+	out.IgnoredInterfaceNames = cloneStrings(opts.IgnoredInterfaceNames)
+	out.IgnoredInterfaceRegexps = cloneStrings(opts.IgnoredInterfaceRegexps)
+	out.allowRules = cloneAllowRules(opts.allowRules)
+	out.Rulesets = make([]ruleset, len(opts.Rulesets))
+	for i, rs := range opts.Rulesets {
+		out.Rulesets[i] = ruleset{
+			Name:       rs.Name,
+			Priority:   rs.Priority,
+			MatchAll:   rs.MatchAll,
+			Trigger:    cloneRulesetTrigger(rs.Trigger),
+			allowRules: cloneAllowRules(rs.allowRules),
+		}
+	}
+	return out
+}
+
+func cloneRulesetTrigger(trigger rulesetTrigger) rulesetTrigger {
+	return rulesetTrigger{
+		InterfaceTypes:   cloneStrings(trigger.InterfaceTypes),
+		InterfaceNames:   cloneStrings(trigger.InterfaceNames),
+		InterfaceRegexps: cloneStrings(trigger.InterfaceRegexps),
+		IPAddrs:          append([]netip.Addr(nil), trigger.IPAddrs...),
+	}
+}
+
+func cloneAllowRules(rules allowRules) allowRules {
+	return allowRules{
+		AllowAll:       rules.AllowAll,
+		EnableV4:       rules.EnableV4,
+		EnableV6:       rules.EnableV6,
+		AllowedMarks:   append([]uint32(nil), rules.AllowedMarks...),
+		AllowedPorts:   append([]portKey(nil), rules.AllowedPorts...),
+		AllowedV4Hosts: append([]uint32(nil), rules.AllowedV4Hosts...),
+		AllowedV6Hosts: append([]ipv6AddrKey(nil), rules.AllowedV6Hosts...),
+		AllowedV4Pairs: append([]hostport4Key(nil), rules.AllowedV4Pairs...),
+		AllowedV6Pairs: append([]hostport6Key(nil), rules.AllowedV6Pairs...),
+	}
+}
+
 func run(parent context.Context, opts options) error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("remove memlock rlimit: %w", err)
@@ -469,14 +941,17 @@ func run(parent context.Context, opts options) error {
 
 	manager := newEgressManager(objs.KillswitchEgress)
 	defer manager.close()
+	var reconcileMu sync.Mutex
 
 	go func() {
-		if err := watchInterfaces(ctx, manager, policies); err != nil {
+		if err := watchInterfaces(ctx, manager, policies, &reconcileMu); err != nil {
 			errCh <- err
 		}
 	}()
 
-	adminServer := newAdminAPIServer(opts.AdminAPI, policies.configSnapshot)
+	adminServer := newAdminAPIServer(opts.AdminAPI, policies.configSnapshot, func(req adminapi.MutationRequest) adminapi.MutationResult {
+		return applyAdminMutation(req, policies, manager, &reconcileMu)
+	})
 	go func() {
 		if err := adminServer.listenAndServe(ctx); err != nil {
 			errCh <- err
@@ -583,6 +1058,18 @@ func newPolicyManager(objs *killswitchObjects, opts options) *policyManager {
 	return &policyManager{objs: objs, opts: opts}
 }
 
+func (m *policyManager) optionsSnapshot() options {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return cloneOptions(m.opts)
+}
+
+func (m *policyManager) replaceOptions(opts options) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.opts = cloneOptions(opts)
+}
+
 func (m *policyManager) reconcileCurrent(logChange bool) (bool, error) {
 	all, err := listInterfaces()
 	if err != nil {
@@ -592,8 +1079,9 @@ func (m *policyManager) reconcileCurrent(logChange bool) (bool, error) {
 }
 
 func (m *policyManager) reconcile(all []interfaceInfo, logChange bool) (bool, error) {
-	active := activeRuleset(all, m.opts.Rulesets)
-	effective := m.opts.allowRules
+	opts := m.optionsSnapshot()
+	active := activeRuleset(all, opts.Rulesets)
+	effective := opts.allowRules
 	activeName := ""
 	if active != nil {
 		effective = mergeAllowRules(effective, active.allowRules)
@@ -625,24 +1113,25 @@ func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 	current := m.current
 	activeName := m.activeName
 	set := m.set
+	opts := cloneOptions(m.opts)
 	m.mu.Unlock()
 
 	if !set {
-		current = m.opts.allowRules
+		current = opts.allowRules
 	}
 	return adminapi.CurrentConfig{
-		InterfaceTypes:          cloneStrings(m.opts.InterfaceTypes),
-		InterfaceNames:          cloneStrings(m.opts.InterfaceNames),
-		InterfaceRegexps:        cloneStrings(m.opts.InterfaceRegexps),
-		IgnoredInterfaceTypes:   cloneStrings(m.opts.IgnoredInterfaceTypes),
-		IgnoredInterfaceNames:   cloneStrings(m.opts.IgnoredInterfaceNames),
-		IgnoredInterfaceRegexps: cloneStrings(m.opts.IgnoredInterfaceRegexps),
-		BasePolicy:              apiAllowRules(m.opts.allowRules),
+		InterfaceTypes:          cloneStrings(opts.InterfaceTypes),
+		InterfaceNames:          cloneStrings(opts.InterfaceNames),
+		InterfaceRegexps:        cloneStrings(opts.InterfaceRegexps),
+		IgnoredInterfaceTypes:   cloneStrings(opts.IgnoredInterfaceTypes),
+		IgnoredInterfaceNames:   cloneStrings(opts.IgnoredInterfaceNames),
+		IgnoredInterfaceRegexps: cloneStrings(opts.IgnoredInterfaceRegexps),
+		BasePolicy:              apiAllowRules(opts.allowRules),
 		EffectivePolicy:         apiAllowRules(current),
 		ActiveRuleset:           activeName,
-		Rulesets:                apiRulesets(m.opts.Rulesets, activeName),
+		Rulesets:                apiRulesets(opts.Rulesets, activeName),
 		AdminAPI: adminapi.AdminConfig{
-			SocketPath: m.opts.AdminAPI.SocketPath,
+			SocketPath: opts.AdminAPI.SocketPath,
 		},
 	}
 }
@@ -1267,7 +1756,7 @@ func (m *egressManager) close() {
 	}
 }
 
-func watchInterfaces(ctx context.Context, manager *egressManager, policies *policyManager) error {
+func watchInterfaces(ctx context.Context, manager *egressManager, policies *policyManager, reconcileMu *sync.Mutex) error {
 	linkUpdates := make(chan netlink.LinkUpdate, 32)
 	addrUpdates := make(chan netlink.AddrUpdate, 32)
 	done := make(chan struct{})
@@ -1293,7 +1782,7 @@ func watchInterfaces(ctx context.Context, manager *egressManager, policies *poli
 		return fmt.Errorf("subscribe to netlink addr updates: %w", err)
 	}
 
-	if _, err := manager.reconcileCurrent(policies.opts, true); err != nil {
+	if _, err := manager.reconcileCurrent(policies.optionsSnapshot(), true); err != nil {
 		return err
 	}
 
@@ -1304,19 +1793,24 @@ func watchInterfaces(ctx context.Context, manager *egressManager, policies *poli
 		case err := <-subscribeErrs:
 			return fmt.Errorf("netlink link watcher: %w", err)
 		case update := <-linkUpdates:
-			shouldReconcileAttachments := manager.shouldReconcileLinkUpdate(update, policies.opts)
+			reconcileMu.Lock()
+			opts := policies.optionsSnapshot()
+			shouldReconcileAttachments := manager.shouldReconcileLinkUpdate(update, opts)
 			if shouldReconcileAttachments {
-				if _, err := manager.reconcileCurrent(policies.opts, false); err != nil {
+				if _, err := manager.reconcileCurrent(opts, false); err != nil {
 					log.Printf("ERROR: reconcile interfaces after netlink update: %s", err)
 				}
 			}
 			if _, err := policies.reconcileCurrent(true); err != nil {
 				log.Printf("ERROR: reconcile rulesets after netlink link update: %s", err)
 			}
+			reconcileMu.Unlock()
 		case <-addrUpdates:
+			reconcileMu.Lock()
 			if _, err := policies.reconcileCurrent(true); err != nil {
 				log.Printf("ERROR: reconcile rulesets after netlink addr update: %s", err)
 			}
+			reconcileMu.Unlock()
 		}
 	}
 }

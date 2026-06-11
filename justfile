@@ -16,5 +16,8 @@ daemon: build
 get-cfg: build
   ./killswitch-cli get-cfg
 
+cli-add: build
+  ./killswitch-cli add -target base_policy.allowed_ports tcp/443
+
 test:
   go test ./... -count=1

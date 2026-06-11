@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -31,6 +34,12 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 	switch args[0] {
 	case "get-cfg":
 		return runGetConfig(args[1:], stdout, stderr)
+	case "add":
+		return runMutation(adminapi.MutationAdd, args[1:], stdout, stderr)
+	case "remove":
+		return runMutation(adminapi.MutationRemove, args[1:], stdout, stderr)
+	case "set":
+		return runMutation(adminapi.MutationSet, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		return printUsage(stdout)
 	default:
@@ -39,6 +48,102 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 		}
 		return fmt.Errorf("unknown subcommand %q", args[0])
 	}
+}
+
+func runMutation(op adminapi.MutationOperation, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet(string(op), flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	target := flags.String("target", "", "mutation target")
+	flags.StringVar(target, "t", "", "mutation target")
+	ruleset := flags.String("ruleset", "", "ruleset name for ruleset mutations")
+	flags.StringVar(ruleset, "r", "", "ruleset name for ruleset mutations")
+	jsonValue := flags.String("json", "", "JSON value for boolean, policy, or ruleset set operations; prefix with @ to read a file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *target == "" {
+		return fmt.Errorf("%s requires -target", op)
+	}
+
+	req := adminapi.MutationRequest{
+		Operation: op,
+		Target:    *target,
+		Ruleset:   *ruleset,
+		Values:    flags.Args(),
+	}
+	if *jsonValue != "" {
+		raw, err := readJSONArgument(*jsonValue)
+		if err != nil {
+			return err
+		}
+		req.Value = raw
+	}
+	if len(req.Value) == 0 && op == adminapi.MutationSet && len(req.Values) == 1 && scalarTarget(*target) {
+		raw, err := scalarJSONValue(req.Values[0])
+		if err != nil {
+			return err
+		}
+		req.Value = raw
+		req.Values = nil
+	}
+
+	client, err := adminapi.DialUnix(context.Background(), *socketPath)
+	if err != nil {
+		return err
+	}
+	defer client.Close() //nolint:errcheck
+
+	result, err := client.Mutate(req)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return errors.New(result.Error)
+	}
+	if result.Changed {
+		_, err = fmt.Fprintln(stdout, "changed")
+	} else {
+		_, err = fmt.Fprintln(stdout, "unchanged")
+	}
+	return err
+}
+
+func readJSONArgument(value string) (json.RawMessage, error) {
+	if strings.HasPrefix(value, "@") {
+		path := strings.TrimPrefix(value, "@")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read JSON value %s: %w", path, err)
+		}
+		return json.RawMessage(raw), nil
+	}
+	return json.RawMessage(value), nil
+}
+
+func scalarTarget(target string) bool {
+	switch target {
+	case "base_policy.allow_all", "base_policy.enable_v4", "base_policy.enable_v6",
+		"ruleset.match_all", "ruleset.priority":
+		return true
+	default:
+		return false
+	}
+}
+
+func scalarJSONValue(value string) (json.RawMessage, error) {
+	if value == "true" || value == "false" {
+		return json.RawMessage(value), nil
+	}
+	if _, err := strconv.Atoi(value); err == nil {
+		return json.RawMessage(value), nil
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
 func runGetConfig(args []string, stdout, stderr io.Writer) error {
@@ -73,7 +178,7 @@ func printUsage(w io.Writer) error {
 	if _, err := fmt.Fprintln(w, "Usage:"); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH]")
+	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH]\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]")
 	return err
 }
 

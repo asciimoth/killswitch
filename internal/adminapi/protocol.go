@@ -11,8 +11,10 @@ const DefaultSocketPath = "/run/killswitch/admin.sock"
 type MessageType string
 
 const (
-	MessageTypeConfigRequest MessageType = "config_request"
-	MessageTypeConfig        MessageType = "config"
+	MessageTypeConfigRequest  MessageType = "config_request"
+	MessageTypeConfig         MessageType = "config"
+	MessageTypeMutation       MessageType = "mutation"
+	MessageTypeMutationResult MessageType = "mutation_result"
 )
 
 type Envelope struct {
@@ -36,6 +38,39 @@ type ConfigMessage struct {
 
 func (ConfigMessage) messageType() MessageType {
 	return MessageTypeConfig
+}
+
+type MutationOperation string
+
+const (
+	MutationAdd    MutationOperation = "add"
+	MutationRemove MutationOperation = "remove"
+	MutationSet    MutationOperation = "set"
+)
+
+type MutationRequest struct {
+	Operation  MutationOperation `json:"operation"`
+	Target     string            `json:"target"`
+	Ruleset    string            `json:"ruleset,omitempty"`
+	Value      json.RawMessage   `json:"value,omitempty"`
+	Values     []string          `json:"values,omitempty"`
+	Policy     *AllowRules       `json:"policy,omitempty"`
+	RulesetDef *RulesetMutation  `json:"ruleset_def,omitempty"`
+}
+
+func (MutationRequest) messageType() MessageType {
+	return MessageTypeMutation
+}
+
+type MutationResult struct {
+	OK      bool          `json:"ok"`
+	Changed bool          `json:"changed"`
+	Error   string        `json:"error,omitempty"`
+	Config  CurrentConfig `json:"config"`
+}
+
+func (MutationResult) messageType() MessageType {
+	return MessageTypeMutationResult
 }
 
 type UnknownMessage struct {
@@ -86,6 +121,13 @@ type Ruleset struct {
 	Policy   AllowRules     `json:"policy"`
 }
 
+type RulesetMutation struct {
+	Priority int            `json:"priority"`
+	MatchAll bool           `json:"match_all"`
+	Trigger  RulesetTrigger `json:"trigger"`
+	Policy   AllowRules     `json:"policy"`
+}
+
 type RulesetTrigger struct {
 	InterfaceTypes   []string `json:"interface_types,omitempty"`
 	InterfaceNames   []string `json:"interface_names,omitempty"`
@@ -123,6 +165,18 @@ func ReadMessage(decoder *json.Decoder) (Message, error) {
 			return nil, err
 		}
 		return msg, nil
+	case MessageTypeMutation:
+		var msg MutationRequest
+		if err := decodePayload(envelope.Payload, &msg); err != nil {
+			return nil, err
+		}
+		return msg, nil
+	case MessageTypeMutationResult:
+		var msg MutationResult
+		if err := decodePayload(envelope.Payload, &msg); err != nil {
+			return nil, err
+		}
+		return msg, nil
 	default:
 		return UnknownMessage(envelope), nil
 	}
@@ -137,6 +191,14 @@ func messagePayload(msg Message) (json.RawMessage, error) {
 	case ConfigMessage:
 		return json.Marshal(typed)
 	case *ConfigMessage:
+		return json.Marshal(typed)
+	case MutationRequest:
+		return json.Marshal(typed)
+	case *MutationRequest:
+		return json.Marshal(typed)
+	case MutationResult:
+		return json.Marshal(typed)
+	case *MutationResult:
 		return json.Marshal(typed)
 	default:
 		return nil, fmt.Errorf("unsupported admin API message type %T", msg)

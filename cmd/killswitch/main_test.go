@@ -3,11 +3,13 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
 	"net/netip"
 	"strings"
 	"testing"
 
+	"github.com/asciimoth/killswitch/internal/adminapi"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -442,6 +444,93 @@ func TestPolicyManagerConfigSnapshotMarksActiveRuleset(t *testing.T) {
 	}
 	if !cfg.Rulesets[0].Policy.EnableV4 || !cfg.Rulesets[1].Policy.EnableV6 {
 		t.Fatalf("ruleset policies were not included: %+v", cfg.Rulesets)
+	}
+}
+
+func TestMutateOptionsAddsBasePolicyAllowlistEntry(t *testing.T) {
+	opts := options{
+		InterfaceNames: []string{"eth0"},
+		allowRules:     allowRules{EnableV4: true},
+	}
+
+	next, err := mutateOptions(opts, adminapi.MutationRequest{
+		Operation: adminapi.MutationAdd,
+		Target:    "base_policy.allowed_ports",
+		Values:    []string{"tcp/443"},
+	})
+	if err != nil {
+		t.Fatalf("mutate options: %v", err)
+	}
+	if len(next.AllowedPorts) != 1 || next.AllowedPorts[0] != (portKey{Dport: htons(443), Protocol: ipProtoTCP}) {
+		t.Fatalf("allowed ports = %+v", next.AllowedPorts)
+	}
+	if len(opts.AllowedPorts) != 0 {
+		t.Fatalf("original options were mutated: %+v", opts.AllowedPorts)
+	}
+}
+
+func TestMutateOptionsRejectsInvalidInputs(t *testing.T) {
+	opts := options{InterfaceNames: []string{"eth0"}}
+	tests := []adminapi.MutationRequest{
+		{Operation: adminapi.MutationSet, Target: "admin_api.socket_path", Value: json.RawMessage(`"/tmp/other.sock"`)},
+		{Operation: adminapi.MutationAdd, Target: "interface_regexps", Values: []string{"["}},
+		{Operation: adminapi.MutationRemove, Target: "interface_names", Values: []string{"eth0"}},
+		{Operation: adminapi.MutationAdd, Target: "base_policy.allowed_ports", Values: []string{"icmp/8"}},
+		{Operation: adminapi.MutationSet, Target: "base_policy.enable_v4", Value: json.RawMessage(`"yes"`)},
+	}
+
+	for _, req := range tests {
+		if _, err := mutateOptions(opts, req); err == nil {
+			t.Fatalf("mutateOptions(%+v) succeeded, expected error", req)
+		}
+	}
+}
+
+func TestMutateOptionsSetsWholeBasePolicy(t *testing.T) {
+	next, err := mutateOptions(options{InterfaceNames: []string{"eth0"}}, adminapi.MutationRequest{
+		Operation: adminapi.MutationSet,
+		Target:    "base_policy",
+		Policy: &adminapi.AllowRules{
+			AllowAll:       true,
+			EnableV4:       true,
+			AllowedV4Hosts: []string{"192.0.2.10"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("mutate options: %v", err)
+	}
+	if !next.AllowAll || !next.EnableV4 || len(next.AllowedV4Hosts) != 1 {
+		t.Fatalf("base policy = %+v", next.allowRules)
+	}
+}
+
+func TestMutateOptionsSetsWholeRuleset(t *testing.T) {
+	next, err := mutateOptions(options{InterfaceNames: []string{"eth0"}}, adminapi.MutationRequest{
+		Operation: adminapi.MutationSet,
+		Target:    "ruleset",
+		Ruleset:   "office",
+		RulesetDef: &adminapi.RulesetMutation{
+			Priority: 20,
+			MatchAll: true,
+			Trigger: adminapi.RulesetTrigger{
+				InterfaceNames: []string{"wg0"},
+				IPAddrs:        []string{"10.64.0.2"},
+			},
+			Policy: adminapi.AllowRules{EnableV6: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("mutate options: %v", err)
+	}
+	if len(next.Rulesets) != 1 {
+		t.Fatalf("rulesets = %+v", next.Rulesets)
+	}
+	ruleset := next.Rulesets[0]
+	if ruleset.Name != "office" || ruleset.Priority != 20 || !ruleset.MatchAll || !ruleset.EnableV6 {
+		t.Fatalf("ruleset = %+v", ruleset)
+	}
+	if len(ruleset.Trigger.IPAddrs) != 1 || ruleset.Trigger.IPAddrs[0] != netipMustParse("10.64.0.2") {
+		t.Fatalf("trigger = %+v", ruleset.Trigger)
 	}
 }
 

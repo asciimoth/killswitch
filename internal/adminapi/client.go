@@ -68,3 +68,25 @@ func (c *Client) WaitForConfig() (CurrentConfig, error) {
 		}
 	}
 }
+
+func (c *Client) Mutate(req MutationRequest) (MutationResult, error) {
+	if err := c.Send(req); err != nil {
+		return MutationResult{}, err
+	}
+	return c.WaitForMutationResult()
+}
+
+func (c *Client) WaitForMutationResult() (MutationResult, error) {
+	for {
+		msg, err := c.Receive()
+		if err != nil {
+			if IsEOF(err) {
+				return MutationResult{}, errors.New("connection closed before mutation result was received")
+			}
+			return MutationResult{}, fmt.Errorf("read admin API message: %w", err)
+		}
+		if result, ok := msg.(MutationResult); ok {
+			return result, nil
+		}
+	}
+}
