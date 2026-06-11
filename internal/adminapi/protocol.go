@@ -13,6 +13,8 @@ type MessageType string
 const (
 	MessageTypeConfigRequest  MessageType = "config_request"
 	MessageTypeConfig         MessageType = "config"
+	MessageTypeSubscribe      MessageType = "subscribe"
+	MessageTypeEvent          MessageType = "event"
 	MessageTypeMutation       MessageType = "mutation"
 	MessageTypeMutationResult MessageType = "mutation_result"
 )
@@ -38,6 +40,31 @@ type ConfigMessage struct {
 
 func (ConfigMessage) messageType() MessageType {
 	return MessageTypeConfig
+}
+
+type EventType string
+
+const (
+	EventTypeConfig     EventType = "config"
+	EventTypeInterfaces EventType = "interfaces"
+	EventTypeClients    EventType = "clients"
+)
+
+type SubscribeRequest struct {
+	EventTypes []EventType `json:"event_types"`
+}
+
+func (SubscribeRequest) messageType() MessageType {
+	return MessageTypeSubscribe
+}
+
+type EventMessage struct {
+	EventType EventType     `json:"event_type"`
+	Config    CurrentConfig `json:"config"`
+}
+
+func (EventMessage) messageType() MessageType {
+	return MessageTypeEvent
 }
 
 type MutationOperation string
@@ -89,12 +116,32 @@ type CurrentConfig struct {
 	IgnoredInterfaceTypes   []string     `json:"ignored_interface_types,omitempty"`
 	IgnoredInterfaceNames   []string     `json:"ignored_interface_names,omitempty"`
 	IgnoredInterfaceRegexps []string     `json:"ignored_interface_regexps,omitempty"`
+	Interfaces              []Interface  `json:"interfaces,omitempty"`
 	BasePolicy              AllowRules   `json:"base_policy"`
 	EffectivePolicy         AllowRules   `json:"effective_policy"`
 	ActiveRuleset           string       `json:"active_ruleset,omitempty"`
 	Rulesets                []Ruleset    `json:"rulesets,omitempty"`
 	TemporaryRulesets       []TmpRuleset `json:"tmp_rulesets,omitempty"`
+	Clients                 []ClientInfo `json:"clients,omitempty"`
 	AdminAPI                AdminConfig  `json:"admin_api"`
+}
+
+type Interface struct {
+	Index      int      `json:"index"`
+	Name       string   `json:"name"`
+	Type       string   `json:"type"`
+	Addrs      []string `json:"addrs,omitempty"`
+	Matched    bool     `json:"matched"`
+	Killswitch bool     `json:"killswitch"`
+}
+
+type ClientInfo struct {
+	ID         uint64      `json:"id"`
+	Owner      string      `json:"owner"`
+	PID        int32       `json:"pid"`
+	UID        uint32      `json:"uid"`
+	GID        uint32      `json:"gid"`
+	EventTypes []EventType `json:"event_types,omitempty"`
 }
 
 type AdminConfig struct {
@@ -171,6 +218,18 @@ func ReadMessage(decoder *json.Decoder) (Message, error) {
 			return nil, err
 		}
 		return msg, nil
+	case MessageTypeSubscribe:
+		var msg SubscribeRequest
+		if err := decodePayload(envelope.Payload, &msg); err != nil {
+			return nil, err
+		}
+		return msg, nil
+	case MessageTypeEvent:
+		var msg EventMessage
+		if err := decodePayload(envelope.Payload, &msg); err != nil {
+			return nil, err
+		}
+		return msg, nil
 	case MessageTypeMutation:
 		var msg MutationRequest
 		if err := decodePayload(envelope.Payload, &msg); err != nil {
@@ -197,6 +256,14 @@ func messagePayload(msg Message) (json.RawMessage, error) {
 	case ConfigMessage:
 		return json.Marshal(typed)
 	case *ConfigMessage:
+		return json.Marshal(typed)
+	case SubscribeRequest:
+		return json.Marshal(typed)
+	case *SubscribeRequest:
+		return json.Marshal(typed)
+	case EventMessage:
+		return json.Marshal(typed)
+	case *EventMessage:
 		return json.Marshal(typed)
 	case MutationRequest:
 		return json.Marshal(typed)

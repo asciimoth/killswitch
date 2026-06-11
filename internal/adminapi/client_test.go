@@ -46,3 +46,38 @@ func TestWaitForConfigIgnoresOtherMessages(t *testing.T) {
 		t.Fatalf("server write: %v", err)
 	}
 }
+
+func TestWaitForEventIgnoresOtherMessages(t *testing.T) {
+	server, clientConn := net.Pipe()
+	defer clientConn.Close() //nolint:errcheck
+
+	errCh := make(chan error, 1)
+	go func() {
+		defer server.Close() //nolint:errcheck
+		encoder := json.NewEncoder(server)
+		if err := WriteMessage(encoder, ConfigMessage{}); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- WriteMessage(encoder, EventMessage{
+			EventType: EventTypeInterfaces,
+			Config: CurrentConfig{
+				Interfaces: []Interface{{Name: "wg0", Type: "wireguard", Matched: true, Killswitch: true}},
+			},
+		})
+	}()
+
+	event, err := NewClient(clientConn).WaitForEvent()
+	if err != nil {
+		t.Fatalf("wait for event: %v", err)
+	}
+	if event.EventType != EventTypeInterfaces {
+		t.Fatalf("event type = %q", event.EventType)
+	}
+	if len(event.Config.Interfaces) != 1 || !event.Config.Interfaces[0].Killswitch {
+		t.Fatalf("interfaces = %+v", event.Config.Interfaces)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("server write: %v", err)
+	}
+}

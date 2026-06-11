@@ -12,7 +12,9 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -57,12 +59,23 @@ type adminAPIServer struct {
 	mutateTmpRuleset func(string, adminapi.MutationRequest) adminapi.MutationResult
 	removeTmpRuleset func(string) adminapi.MutationResult
 	nextConnectionID atomic.Uint64
+	mu               sync.Mutex
+	clients          map[uint64]*adminAPIClient
 }
 
 type adminAPIPeer struct {
 	UID uint32
 	GID uint32
 	PID int32
+}
+
+type adminAPIClient struct {
+	id          uint64
+	owner       string
+	peer        adminAPIPeer
+	eventTypes  map[adminapi.EventType]bool
+	writeMu     sync.Mutex
+	eventWriter *json.Encoder
 }
 
 func adminAPIOptionsFromConfig(cfg adminAPIConfig) adminAPIOptions {
@@ -113,7 +126,7 @@ func newAdminAPIServer(opts adminAPIOptions, configSnapshot func() adminapi.Curr
 			return adminapi.MutationResult{OK: false, Error: "mutations are not available", Config: configSnapshot()}
 		}
 	}
-	return &adminAPIServer{opts: opts, configSnapshot: configSnapshot, mutateConfig: mutateConfig}
+	return &adminAPIServer{opts: opts, configSnapshot: configSnapshot, mutateConfig: mutateConfig, clients: make(map[uint64]*adminAPIClient)}
 }
 
 func (s *adminAPIServer) setTemporaryRulesetCallbacks(mutate func(string, adminapi.MutationRequest) adminapi.MutationResult, remove func(string) adminapi.MutationResult) {
@@ -254,21 +267,24 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 	}
 
 	log.Printf("Admin API connection authorized: pid=%d uid=%d gid=%d rule=%s", peer.PID, peer.UID, peer.GID, reason)
-	owner := s.clientOwner(peer)
+	client := s.addClient(peer, json.NewEncoder(conn))
+	s.notify(adminapi.EventTypeClients)
 	defer func() {
+		s.removeClient(client.id)
+		s.notify(adminapi.EventTypeClients)
 		if s.removeTmpRuleset == nil {
 			return
 		}
-		result := s.removeTmpRuleset(owner)
+		result := s.removeTmpRuleset(client.owner)
 		if !result.OK {
 			log.Printf("Admin API failed to remove temporary ruleset for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, result.Error)
 		} else if result.Changed {
 			log.Printf("Admin API removed temporary ruleset for pid=%d uid=%d gid=%d", peer.PID, peer.UID, peer.GID)
+			s.notify(adminapi.EventTypeConfig)
 		}
 	}()
 
 	decoder := json.NewDecoder(conn)
-	encoder := json.NewEncoder(conn)
 	for {
 		msg, err := adminapi.ReadMessage(decoder)
 		if err != nil {
@@ -281,20 +297,26 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 
 		switch msg := msg.(type) {
 		case adminapi.ConfigRequest:
-			if err := adminapi.WriteMessage(encoder, adminapi.ConfigMessage{Config: s.configSnapshot()}); err != nil {
+			if err := client.send(adminapi.ConfigMessage{Config: s.configSnapshot()}); err != nil {
 				log.Printf("Admin API write config for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, err)
 				return
 			}
+		case adminapi.SubscribeRequest:
+			s.setClientSubscriptions(client.id, msg.EventTypes)
+			s.notify(adminapi.EventTypeClients)
 		case adminapi.MutationRequest:
-			result := s.handleMutation(owner, msg)
+			result := s.handleMutation(client.owner, msg)
 			if !result.OK {
 				log.Printf("Admin API rejected mutation for pid=%d uid=%d gid=%d op=%s target=%s ruleset=%s: %s", peer.PID, peer.UID, peer.GID, msg.Operation, msg.Target, msg.Ruleset, result.Error)
 			} else if result.Changed {
 				log.Printf("Admin API applied mutation for pid=%d uid=%d gid=%d op=%s target=%s ruleset=%s", peer.PID, peer.UID, peer.GID, msg.Operation, msg.Target, msg.Ruleset)
 			}
-			if err := adminapi.WriteMessage(encoder, result); err != nil {
+			if err := client.send(result); err != nil {
 				log.Printf("Admin API write mutation result for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, err)
 				return
+			}
+			if result.OK {
+				s.notify(adminapi.EventTypeConfig)
 			}
 		case adminapi.UnknownMessage:
 			log.Printf("Admin API ignored unknown message for pid=%d uid=%d gid=%d", peer.PID, peer.UID, peer.GID)
@@ -304,9 +326,106 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 	}
 }
 
-func (s *adminAPIServer) clientOwner(peer adminAPIPeer) string {
+func (s *adminAPIServer) addClient(peer adminAPIPeer, encoder *json.Encoder) *adminAPIClient {
 	id := s.nextConnectionID.Add(1)
-	return fmt.Sprintf("pid=%d uid=%d gid=%d conn=%d", peer.PID, peer.UID, peer.GID, id)
+	client := &adminAPIClient{
+		id:          id,
+		owner:       fmt.Sprintf("pid=%d uid=%d gid=%d conn=%d", peer.PID, peer.UID, peer.GID, id),
+		peer:        peer,
+		eventTypes:  make(map[adminapi.EventType]bool),
+		eventWriter: encoder,
+	}
+	s.mu.Lock()
+	s.clients[id] = client
+	s.mu.Unlock()
+	return client
+}
+
+func (s *adminAPIServer) removeClient(id uint64) {
+	s.mu.Lock()
+	delete(s.clients, id)
+	s.mu.Unlock()
+}
+
+func (s *adminAPIServer) setClientSubscriptions(id uint64, eventTypes []adminapi.EventType) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	client, ok := s.clients[id]
+	if !ok {
+		return
+	}
+	client.eventTypes = make(map[adminapi.EventType]bool, len(eventTypes))
+	for _, eventType := range eventTypes {
+		client.eventTypes[eventType] = true
+	}
+}
+
+func (s *adminAPIServer) clientSnapshot() []adminapi.ClientInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := make([]uint64, 0, len(s.clients))
+	for id := range s.clients {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return ids[i] < ids[j]
+	})
+
+	out := make([]adminapi.ClientInfo, 0, len(ids))
+	for _, id := range ids {
+		client := s.clients[id]
+		out = append(out, adminapi.ClientInfo{
+			ID:         client.id,
+			Owner:      client.owner,
+			PID:        client.peer.PID,
+			UID:        client.peer.UID,
+			GID:        client.peer.GID,
+			EventTypes: sortedEventTypes(client.eventTypes),
+		})
+	}
+	return out
+}
+
+func (s *adminAPIServer) notify(eventType adminapi.EventType) {
+	s.mu.Lock()
+	clients := make([]*adminAPIClient, 0, len(s.clients))
+	for _, client := range s.clients {
+		if client.eventTypes[eventType] {
+			clients = append(clients, client)
+		}
+	}
+	s.mu.Unlock()
+	if len(clients) == 0 {
+		return
+	}
+
+	msg := adminapi.EventMessage{EventType: eventType, Config: s.configSnapshot()}
+	for _, client := range clients {
+		if err := client.send(msg); err != nil {
+			log.Printf("Admin API write %s event for pid=%d uid=%d gid=%d: %s", eventType, client.peer.PID, client.peer.UID, client.peer.GID, err)
+		}
+	}
+}
+
+func (c *adminAPIClient) send(msg adminapi.Message) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return adminapi.WriteMessage(c.eventWriter, msg)
+}
+
+func sortedEventTypes(values map[adminapi.EventType]bool) []adminapi.EventType {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]adminapi.EventType, 0, len(values))
+	for eventType := range values {
+		out = append(out, eventType)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i] < out[j]
+	})
+	return out
 }
 
 func (s *adminAPIServer) handleMutation(owner string, req adminapi.MutationRequest) adminapi.MutationResult {

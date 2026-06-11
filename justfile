@@ -14,7 +14,7 @@ daemon: build
   sudo ./killswitch ./killswitch.example.json
 
 get-cfg: build
-  ./killswitch-cli get-cfg
+  ./killswitch-cli get-cfg --watch
 
 cli-add: build
   ./killswitch-cli add -target base_policy.allowed_ports tcp/443

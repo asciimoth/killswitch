@@ -54,6 +54,10 @@ func (c *Client) RequestConfig() error {
 	return c.Send(ConfigRequest{})
 }
 
+func (c *Client) Subscribe(eventTypes ...EventType) error {
+	return c.Send(SubscribeRequest{EventTypes: eventTypes})
+}
+
 func (c *Client) WaitForConfig() (CurrentConfig, error) {
 	for {
 		msg, err := c.Receive()
@@ -65,6 +69,21 @@ func (c *Client) WaitForConfig() (CurrentConfig, error) {
 		}
 		if cfg, ok := msg.(ConfigMessage); ok {
 			return cfg.Config, nil
+		}
+	}
+}
+
+func (c *Client) WaitForEvent() (EventMessage, error) {
+	for {
+		msg, err := c.Receive()
+		if err != nil {
+			if IsEOF(err) {
+				return EventMessage{}, errors.New("connection closed before event was received")
+			}
+			return EventMessage{}, fmt.Errorf("read admin API message: %w", err)
+		}
+		if event, ok := msg.(EventMessage); ok {
+			return event, nil
 		}
 	}
 }

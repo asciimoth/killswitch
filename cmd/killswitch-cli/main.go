@@ -276,6 +276,7 @@ func runGetConfig(args []string, stdout, stderr io.Writer) error {
 	flags.SetOutput(stderr)
 	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
 	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	watch := flags.Bool("watch", false, "subscribe to config, interface, and client events and re-print on updates")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -289,6 +290,11 @@ func runGetConfig(args []string, stdout, stderr io.Writer) error {
 	}
 	defer client.Close() //nolint:errcheck
 
+	if *watch {
+		if err := client.Subscribe(adminapi.EventTypeConfig, adminapi.EventTypeInterfaces, adminapi.EventTypeClients); err != nil {
+			return err
+		}
+	}
 	if err := client.RequestConfig(); err != nil {
 		return err
 	}
@@ -296,14 +302,58 @@ func runGetConfig(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return printConfig(stdout, cfg)
+	if err := printConfig(stdout, cfg); err != nil {
+		return err
+	}
+	if !*watch {
+		return nil
+	}
+	return watchConfig(client, stdout)
+}
+
+func watchConfig(client *adminapi.Client, stdout io.Writer) error {
+	events := make(chan adminapi.EventMessage, 1)
+	errs := make(chan error, 1)
+	go func() {
+		for {
+			event, err := client.WaitForEvent()
+			if err != nil {
+				errs <- err
+				return
+			}
+			events <- event
+		}
+	}()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	for {
+		select {
+		case event := <-events:
+			if _, err := fmt.Fprintf(stdout, "\nEvent: %s\n\n", event.EventType); err != nil {
+				return err
+			}
+			if err := printConfig(stdout, event.Config); err != nil {
+				return err
+			}
+		case err := <-errs:
+			if adminapi.IsEOF(err) {
+				return errors.New("server disconnected")
+			}
+			return err
+		case <-signals:
+			return nil
+		}
+	}
 }
 
 func printUsage(w io.Writer) error {
 	if _, err := fmt.Fprintln(w, "Usage:"); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH]\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -json JSON|-json @FILE")
+	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch]\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -json JSON|-json @FILE")
 	return err
 }
 
@@ -322,6 +372,15 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 	printer.printList("  ignored types", cfg.IgnoredInterfaceTypes)
 	printer.printList("  ignored names", cfg.IgnoredInterfaceNames)
 	printer.printList("  ignored regexps", cfg.IgnoredInterfaceRegexps)
+	if len(cfg.Interfaces) == 0 {
+		printer.println("  current:\t-")
+	} else {
+		printer.println("  current:")
+		for _, iface := range cfg.Interfaces {
+			printer.printf("    %s:\tindex=%d type=%s matched=%t killswitch=%t\n", iface.Name, iface.Index, iface.Type, iface.Matched, iface.Killswitch)
+			printer.printList("      addrs", iface.Addrs)
+		}
+	}
 	printer.println()
 
 	printer.println("Base policy")
@@ -355,6 +414,17 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 		for i, ruleset := range cfg.TemporaryRulesets {
 			printer.printf("  #%d:\tclient=%s\n", i+1, ruleset.Client)
 			printer.printAllowRulesWithPrefix("    ", ruleset.Policy)
+		}
+	}
+
+	printer.println()
+	printer.println("Clients")
+	if len(cfg.Clients) == 0 {
+		printer.println("  current:\t-")
+	} else {
+		for _, client := range cfg.Clients {
+			printer.printf("  #%d:\tpid=%d uid=%d gid=%d owner=%s\n", client.ID, client.PID, client.UID, client.GID, client.Owner)
+			printer.printEventTypes("    events", client.EventTypes)
 		}
 	}
 
@@ -405,4 +475,16 @@ func (p *outputPrinter) printList(label string, values []string) {
 		return
 	}
 	p.printf("%s:\t%s\n", label, strings.Join(values, ", "))
+}
+
+func (p *outputPrinter) printEventTypes(label string, values []adminapi.EventType) {
+	if len(values) == 0 {
+		p.printf("%s:\t-\n", label)
+		return
+	}
+	text := make([]string, 0, len(values))
+	for _, value := range values {
+		text = append(text, string(value))
+	}
+	p.printf("%s:\t%s\n", label, strings.Join(text, ", "))
 }

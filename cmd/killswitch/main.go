@@ -199,6 +199,7 @@ type attachedInterface struct {
 }
 
 type egressManager struct {
+	mu       sync.Mutex
 	program  *ebpf.Program
 	attached map[int]attachedInterface
 }
@@ -1002,13 +1003,11 @@ func run(parent context.Context, opts options) error {
 	defer manager.close()
 	var reconcileMu sync.Mutex
 
-	go func() {
-		if err := watchInterfaces(ctx, manager, policies, &reconcileMu); err != nil {
-			errCh <- err
-		}
-	}()
-
-	adminServer := newAdminAPIServer(opts.AdminAPI, policies.configSnapshot, func(req adminapi.MutationRequest) adminapi.MutationResult {
+	var adminServer *adminAPIServer
+	configSnapshot := func() adminapi.CurrentConfig {
+		return currentConfigSnapshot(policies, manager, adminServer.clientSnapshot)
+	}
+	adminServer = newAdminAPIServer(opts.AdminAPI, configSnapshot, func(req adminapi.MutationRequest) adminapi.MutationResult {
 		return applyAdminMutation(req, policies, manager, &reconcileMu)
 	})
 	adminServer.setTemporaryRulesetCallbacks(
@@ -1019,6 +1018,13 @@ func run(parent context.Context, opts options) error {
 			return removeTemporaryRuleset(owner, policies, &reconcileMu)
 		},
 	)
+	go func() {
+		if err := watchInterfaces(ctx, manager, policies, &reconcileMu, func(eventType adminapi.EventType) {
+			adminServer.notify(eventType)
+		}); err != nil {
+			errCh <- err
+		}
+	}()
 	go func() {
 		if err := adminServer.listenAndServe(ctx); err != nil {
 			errCh <- err
@@ -1229,6 +1235,21 @@ func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 	}
 }
 
+func currentConfigSnapshot(policies *policyManager, manager *egressManager, clients func() []adminapi.ClientInfo) adminapi.CurrentConfig {
+	cfg := policies.configSnapshot()
+	opts := policies.optionsSnapshot()
+	all, err := listInterfaces()
+	if err != nil {
+		log.Printf("ERROR: list interfaces for admin API snapshot: %s", err)
+	} else {
+		cfg.Interfaces = apiInterfaces(all, opts, manager)
+	}
+	if clients != nil {
+		cfg.Clients = clients()
+	}
+	return cfg
+}
+
 type temporaryRuleset struct {
 	Owner string
 	Rules allowRules
@@ -1360,6 +1381,42 @@ func apiAddrs(values []netip.Addr) []string {
 	out := make([]string, 0, len(values))
 	for _, value := range values {
 		out = append(out, value.String())
+	}
+	return out
+}
+
+func apiInterfaces(all []interfaceInfo, opts options, manager *egressManager) []adminapi.Interface {
+	if len(all) == 0 {
+		return nil
+	}
+	attached := manager.attachedIndexSnapshot()
+	out := make([]adminapi.Interface, 0, len(all))
+	for _, iface := range all {
+		matched, err := interfaceMatchesSelectors(iface, opts)
+		if err != nil {
+			log.Printf("ERROR: match interface %s(index %d) for admin API snapshot: %s", iface.Name, iface.Index, err)
+		}
+		out = append(out, adminapi.Interface{
+			Index:      iface.Index,
+			Name:       iface.Name,
+			Type:       iface.Type,
+			Addrs:      apiAddrs(iface.Addrs),
+			Matched:    matched,
+			Killswitch: attached[iface.Index],
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+func (m *egressManager) attachedIndexSnapshot() map[int]bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[int]bool, len(m.attached))
+	for index := range m.attached {
+		out[index] = true
 	}
 	return out
 }
@@ -1808,6 +1865,9 @@ func (m *egressManager) reconcileCurrent(opts options, strict bool) (bool, error
 }
 
 func (m *egressManager) reconcile(selected []interfaceInfo, strict bool) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	desired := make(map[int]interfaceInfo, len(selected))
 	for _, iface := range selected {
 		desired[iface.Index] = iface
@@ -1852,7 +1912,7 @@ func (m *egressManager) reconcile(selected []interfaceInfo, strict bool) (bool, 
 	}
 
 	if changed {
-		log.Printf("Kill switch attached to: %s", interfaceNames(m.attachedInterfaces()))
+		log.Printf("Kill switch attached to: %s", interfaceNames(m.attachedInterfacesLocked()))
 	}
 	if strict {
 		return changed, attachErr
@@ -1860,7 +1920,7 @@ func (m *egressManager) reconcile(selected []interfaceInfo, strict bool) (bool, 
 	return changed, nil
 }
 
-func (m *egressManager) attachedInterfaces() []interfaceInfo {
+func (m *egressManager) attachedInterfacesLocked() []interfaceInfo {
 	ifaces := make([]interfaceInfo, 0, len(m.attached))
 	for _, attached := range m.attached {
 		ifaces = append(ifaces, attached.info)
@@ -1872,6 +1932,8 @@ func (m *egressManager) attachedInterfaces() []interfaceInfo {
 }
 
 func (m *egressManager) close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for index, attached := range m.attached {
 		if err := attached.link.Close(); err != nil {
 			log.Printf("closing link for %s(index %d): %s", attached.info.Name, attached.info.Index, err)
@@ -1880,7 +1942,7 @@ func (m *egressManager) close() {
 	}
 }
 
-func watchInterfaces(ctx context.Context, manager *egressManager, policies *policyManager, reconcileMu *sync.Mutex) error {
+func watchInterfaces(ctx context.Context, manager *egressManager, policies *policyManager, reconcileMu *sync.Mutex, notify func(adminapi.EventType)) error {
 	linkUpdates := make(chan netlink.LinkUpdate, 32)
 	addrUpdates := make(chan netlink.AddrUpdate, 32)
 	done := make(chan struct{})
@@ -1909,6 +1971,9 @@ func watchInterfaces(ctx context.Context, manager *egressManager, policies *poli
 	if _, err := manager.reconcileCurrent(policies.optionsSnapshot(), true); err != nil {
 		return err
 	}
+	if notify != nil {
+		notify(adminapi.EventTypeInterfaces)
+	}
 
 	for {
 		select {
@@ -1929,12 +1994,20 @@ func watchInterfaces(ctx context.Context, manager *egressManager, policies *poli
 				log.Printf("ERROR: reconcile rulesets after netlink link update: %s", err)
 			}
 			reconcileMu.Unlock()
+			if notify != nil {
+				notify(adminapi.EventTypeInterfaces)
+				notify(adminapi.EventTypeConfig)
+			}
 		case <-addrUpdates:
 			reconcileMu.Lock()
 			if _, err := policies.reconcileCurrent(true); err != nil {
 				log.Printf("ERROR: reconcile rulesets after netlink addr update: %s", err)
 			}
 			reconcileMu.Unlock()
+			if notify != nil {
+				notify(adminapi.EventTypeInterfaces)
+				notify(adminapi.EventTypeConfig)
+			}
 		}
 	}
 }
@@ -1965,6 +2038,8 @@ func (m *egressManager) shouldReconcileLinkUpdate(update netlink.LinkUpdate, opt
 }
 
 func (m *egressManager) isAttached(index int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	_, ok := m.attached[index]
 	return ok
 }
