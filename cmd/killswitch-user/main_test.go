@@ -108,6 +108,12 @@ func TestLoadOptionsCreatesDefaultConfig(t *testing.T) {
 	if cfg.SocketPath != adminapi.DefaultSocketPath {
 		t.Fatalf("default config socket path = %q", cfg.SocketPath)
 	}
+	if cfg.NotifyInterfaceChanges == nil || !*cfg.NotifyInterfaceChanges {
+		t.Fatalf("default config notify_interface_changes = %v", cfg.NotifyInterfaceChanges)
+	}
+	if cfg.NotifyGlobalAllowAll == nil || !*cfg.NotifyGlobalAllowAll {
+		t.Fatalf("default config notify_global_allow_all = %v", cfg.NotifyGlobalAllowAll)
+	}
 }
 
 func TestLoadOptionsRejectsGroupWritableConfig(t *testing.T) {
@@ -132,6 +138,24 @@ func TestLoadOptionsRejectsRelativeSocketPath(t *testing.T) {
 
 	if _, err := loadOptions(configPath, mapEnv(nil)); err == nil {
 		t.Fatal("load options succeeded, expected relative socket path error")
+	}
+}
+
+func TestLoadOptionsReadsNotificationToggles(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "killswitch-user.json")
+	if err := os.WriteFile(configPath, []byte(`{"socket_path":"/tmp/admin.sock","notify_interface_changes":false,"notify_global_allow_all":false}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	opts, err := loadOptions(configPath, mapEnv(nil))
+	if err != nil {
+		t.Fatalf("load options: %v", err)
+	}
+	if opts.NotifyInterfaceChanges {
+		t.Fatal("notify interface changes enabled, want disabled")
+	}
+	if opts.NotifyGlobalAllowAll {
+		t.Fatal("notify global allow all enabled, want disabled")
 	}
 }
 
@@ -188,8 +212,25 @@ func TestRunClientSubscribesAllEventsAndNotifies(t *testing.T) {
 			serverErr <- errors.New("unexpected event types")
 			return
 		}
+		msg, err = adminapi.ReadMessage(decoder)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if _, ok := msg.(adminapi.ConfigRequest); !ok {
+			serverErr <- errors.New("second message was not config request")
+			return
+		}
 
 		encoder := json.NewEncoder(serverConn)
+		if err := adminapi.WriteMessage(encoder, adminapi.ConfigMessage{
+			Config: adminapi.CurrentConfig{
+				Interfaces: []adminapi.Interface{{Name: "eth0", Type: "device"}},
+			},
+		}); err != nil {
+			serverErr <- err
+			return
+		}
 		if err := adminapi.WriteMessage(encoder, adminapi.EventMessage{EventType: adminapi.EventTypeInterfaces}); err != nil {
 			serverErr <- err
 			return
@@ -208,7 +249,7 @@ func TestRunClientSubscribesAllEventsAndNotifies(t *testing.T) {
 		serverErr <- nil
 	}()
 
-	if err := runClient(ctx, client, notifications); err != nil {
+	if err := runClient(ctx, client, notifications, options{NotifyInterfaceChanges: true, NotifyGlobalAllowAll: true}); err != nil {
 		t.Fatalf("run client: %v", err)
 	}
 	if err := <-serverErr; err != nil {
@@ -220,6 +261,77 @@ func TestRunClientSubscribesAllEventsAndNotifies(t *testing.T) {
 	}
 	if notifications.notifications[0].Header != "Network blocked" {
 		t.Fatalf("notification = %+v", notifications.notifications[0])
+	}
+}
+
+func TestConfigNotificationWatcherNotifiesOnlyInterfaceAppearGone(t *testing.T) {
+	notifications := &recordingNotifier{}
+	watcher := configNotificationWatcher{notifyInterfaceChanges: true, notifyGlobalAllowAll: true}
+	watcher.applyInitial(adminapi.CurrentConfig{
+		Interfaces: []adminapi.Interface{{Name: "eth0", Type: "device", Matched: true}},
+	})
+
+	watcher.update(notifications, adminapi.CurrentConfig{
+		Interfaces: []adminapi.Interface{{Name: "eth0", Type: "device", Matched: false, Killswitch: true}},
+	})
+	if len(notifications.notifications) != 0 {
+		t.Fatalf("metadata-only notifications = %+v", notifications.notifications)
+	}
+
+	watcher.update(notifications, adminapi.CurrentConfig{
+		Interfaces: []adminapi.Interface{
+			{Name: "eth0", Type: "device"},
+			{Name: "wg0", Type: "wireguard"},
+		},
+	})
+	watcher.update(notifications, adminapi.CurrentConfig{
+		Interfaces: []adminapi.Interface{{Name: "wg0", Type: "wireguard"}},
+	})
+
+	if len(notifications.notifications) != 2 {
+		t.Fatalf("notifications = %+v", notifications.notifications)
+	}
+	if notifications.notifications[0].Header != "Interface appeared" || notifications.notifications[0].Text != "wg0 (wireguard)" {
+		t.Fatalf("appeared notification = %+v", notifications.notifications[0])
+	}
+	if notifications.notifications[1].Header != "Interface disappeared" || notifications.notifications[1].Text != "eth0 (device)" {
+		t.Fatalf("disappeared notification = %+v", notifications.notifications[1])
+	}
+}
+
+func TestConfigNotificationWatcherGlobalAllowAll(t *testing.T) {
+	notifications := &recordingNotifier{}
+	disableAllowAll := make(chan struct{}, 1)
+	watcher := configNotificationWatcher{
+		notifyGlobalAllowAll: true,
+		disableAllowAll:      disableAllowAll,
+	}
+
+	watcher.applyInitial(adminapi.CurrentConfig{})
+	watcher.updateGlobalAllowAll(notifications, adminapi.CurrentConfig{
+		BasePolicy: adminapi.AllowRules{AllowAll: true},
+	})
+	if notifications.globalAllowAllCount != 1 {
+		t.Fatalf("global allow all notifications = %d", notifications.globalAllowAllCount)
+	}
+
+	notifications.disableGlobalAllowAll()
+	select {
+	case <-disableAllowAll:
+	default:
+		t.Fatal("disable allow_all action was not forwarded")
+	}
+
+	watcher.updateGlobalAllowAll(notifications, adminapi.CurrentConfig{
+		BasePolicy: adminapi.AllowRules{AllowAll: true},
+	})
+	if notifications.globalAllowAllCount != 1 {
+		t.Fatalf("global allow all notification repeated: %d", notifications.globalAllowAllCount)
+	}
+
+	watcher.updateGlobalAllowAll(notifications, adminapi.CurrentConfig{})
+	if notifications.closeGlobalAllowAllCount != 1 {
+		t.Fatalf("closed global allow all notifications = %d", notifications.closeGlobalAllowAllCount)
 	}
 }
 
@@ -245,8 +357,12 @@ func TestNotificationTitle(t *testing.T) {
 }
 
 type recordingNotifier struct {
-	notifications []adminapi.Notification
-	cancel        context.CancelFunc
+	notifications            []adminapi.Notification
+	cancel                   context.CancelFunc
+	globalAllowAllCount      int
+	closeGlobalAllowAllCount int
+	disableGlobalAllowAll    func()
+	closed                   bool
 }
 
 func (n *recordingNotifier) Notify(notification adminapi.Notification) error {
@@ -254,6 +370,22 @@ func (n *recordingNotifier) Notify(notification adminapi.Notification) error {
 	if n.cancel != nil {
 		n.cancel()
 	}
+	return nil
+}
+
+func (n *recordingNotifier) NotifyGlobalAllowAll(disable func()) error {
+	n.globalAllowAllCount++
+	n.disableGlobalAllowAll = disable
+	return nil
+}
+
+func (n *recordingNotifier) CloseGlobalAllowAll() error {
+	n.closeGlobalAllowAllCount++
+	return nil
+}
+
+func (n *recordingNotifier) Close() error {
+	n.closed = true
 	return nil
 }
 

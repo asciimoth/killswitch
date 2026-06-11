@@ -34,6 +34,9 @@ cli-add: build
 tmp-ruleset: build
   ./killswitch-cli tmp-ruleset -interfaces wg0 -json '{"enable_v4":true,"allowed_v4_hostports":["udp/198.51.100.10:51820"]}'
 
+allow-all: build
+  ./killswitch-cli set -target base_policy.allow_all true
+
 force-ruleset: build
   ./killswitch-cli force-ruleset -interfaces enp86s0u1u1 -ruleset wireguard-up
 
