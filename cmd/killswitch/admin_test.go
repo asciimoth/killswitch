@@ -3,12 +3,16 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/user"
 	"path/filepath"
 	"testing"
+
+	"github.com/asciimoth/killswitch/internal/adminapi"
 )
 
 func TestAdminAPIOptionsDefault(t *testing.T) {
@@ -29,6 +33,7 @@ func TestAdminAPIOptionsFromConfig(t *testing.T) {
 		InterfaceNames: []string{"eth0"},
 		AdminAPI: adminAPIConfig{
 			SocketPath: "/tmp/killswitch-admin.sock",
+			Debug:      true,
 			Auth: adminAPIAuthConfig{
 				UIDs:       []uint32{1000},
 				GIDs:       []uint32{1001},
@@ -45,6 +50,9 @@ func TestAdminAPIOptionsFromConfig(t *testing.T) {
 	}
 	if len(opts.AdminAPI.Auth.Groupnames) != 1 || opts.AdminAPI.Auth.Groupnames[0] != "wheel" {
 		t.Fatalf("auth rules = %+v", opts.AdminAPI.Auth)
+	}
+	if !opts.AdminAPI.Debug {
+		t.Fatal("debug flag was not parsed")
 	}
 }
 
@@ -213,6 +221,58 @@ func TestAdminAPIPeerCred(t *testing.T) {
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("peer cred: %v", err)
+	}
+}
+
+func TestAdminAPINotificationBuffersUntilSubscriber(t *testing.T) {
+	server := newAdminAPIServer(adminAPIOptions{}, nil, nil)
+	server.notifyNotification(adminapi.Notification{
+		Level:  adminapi.NotificationLevelError,
+		Header: "Test",
+		Text:   "buffered error",
+	})
+
+	var out bytes.Buffer
+	client := &adminAPIClient{
+		id:          1,
+		eventTypes:  map[adminapi.EventType]bool{adminapi.EventTypeNotification: true},
+		eventWriter: json.NewEncoder(&out),
+	}
+	server.drainNotifications(client)
+
+	decoder := json.NewDecoder(&out)
+	msg, err := adminapi.ReadMessage(decoder)
+	if err != nil {
+		t.Fatalf("read notification event: %v", err)
+	}
+	event, ok := msg.(adminapi.EventMessage)
+	if !ok {
+		t.Fatalf("message type = %T", msg)
+	}
+	if event.EventType != adminapi.EventTypeNotification {
+		t.Fatalf("event type = %q", event.EventType)
+	}
+	if event.Notification.Level != adminapi.NotificationLevelError || event.Notification.Header != "Test" || event.Notification.Text != "buffered error" {
+		t.Fatalf("notification = %+v", event.Notification)
+	}
+	if len(server.notifications) != 0 {
+		t.Fatalf("buffer was not drained: %+v", server.notifications)
+	}
+}
+
+func TestAdminAPIDebugNotifyRequiresDebugFlag(t *testing.T) {
+	notification := adminapi.Notification{Level: adminapi.NotificationLevelWarn, Text: "debug"}
+	server := newAdminAPIServer(adminAPIOptions{}, nil, nil)
+	if result := server.handleDebugNotify(adminapi.DebugNotifyRequest{Notification: notification}); result.OK || result.Error == "" {
+		t.Fatalf("disabled debug result = %+v", result)
+	}
+
+	server = newAdminAPIServer(adminAPIOptions{Debug: true}, nil, nil)
+	if result := server.handleDebugNotify(adminapi.DebugNotifyRequest{Notification: notification}); !result.OK || result.Error != "" {
+		t.Fatalf("enabled debug result = %+v", result)
+	}
+	if len(server.notifications) != 1 || server.notifications[0].Text != "debug" {
+		t.Fatalf("buffered notifications = %+v", server.notifications)
 	}
 }
 

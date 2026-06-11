@@ -16,6 +16,12 @@ daemon: build
 get-cfg: build
   ./killswitch-cli get-cfg --watch
 
+notifications: build
+  ./killswitch-cli notifications
+
+debug-notify level="error" text="debug notification" header="Debug": build
+  ./killswitch-cli debug-notify -level '{{level}}' -header '{{header}}' -text '{{text}}'
+
 cli-add: build
   ./killswitch-cli add -target base_policy.allowed_ports tcp/443
 

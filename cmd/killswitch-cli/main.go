@@ -45,6 +45,10 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 		return runMutation(adminapi.MutationSet, args[1:], stdout, stderr)
 	case "tmp-ruleset":
 		return runTemporaryRuleset(args[1:], os.Stdin, stdout, stderr)
+	case "notifications":
+		return runNotifications(args[1:], stdout, stderr)
+	case "debug-notify":
+		return runDebugNotify(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		return printUsage(stdout)
 	default:
@@ -53,6 +57,103 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 		}
 		return fmt.Errorf("unknown subcommand %q", args[0])
 	}
+}
+
+func runNotifications(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("notifications", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("notifications expects no positional arguments, got: %s", strings.Join(flags.Args(), " "))
+	}
+
+	client, err := adminapi.DialUnix(context.Background(), *socketPath)
+	if err != nil {
+		return err
+	}
+	defer client.Close() //nolint:errcheck
+	if err := client.Subscribe(adminapi.EventTypeNotification); err != nil {
+		return err
+	}
+	return watchNotifications(client, stdout)
+}
+
+func watchNotifications(client *adminapi.Client, stdout io.Writer) error {
+	events := make(chan adminapi.Notification, 1)
+	errs := make(chan error, 1)
+	go func() {
+		for {
+			notification, err := client.WaitForNotification()
+			if err != nil {
+				errs <- err
+				return
+			}
+			events <- notification
+		}
+	}()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	for {
+		select {
+		case notification := <-events:
+			if err := printNotification(stdout, notification); err != nil {
+				return err
+			}
+		case err := <-errs:
+			if adminapi.IsEOF(err) {
+				return errors.New("server disconnected")
+			}
+			return err
+		case <-signals:
+			return nil
+		}
+	}
+}
+
+func runDebugNotify(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("debug-notify", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	level := flags.String("level", string(adminapi.NotificationLevelNormal), "notification level: normal, warn, or error")
+	header := flags.String("header", "", "optional notification header")
+	text := flags.String("text", "", "notification text")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("debug-notify expects no positional arguments, got: %s", strings.Join(flags.Args(), " "))
+	}
+	if *text == "" {
+		return errors.New("debug-notify requires -text")
+	}
+
+	client, err := adminapi.DialUnix(context.Background(), *socketPath)
+	if err != nil {
+		return err
+	}
+	defer client.Close() //nolint:errcheck
+
+	result, err := client.DebugNotify(adminapi.Notification{
+		Level:  adminapi.NotificationLevel(*level),
+		Header: *header,
+		Text:   *text,
+	})
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return errors.New(result.Error)
+	}
+	_, err = fmt.Fprintln(stdout, "sent")
+	return err
 }
 
 func runTemporaryRuleset(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -353,7 +454,16 @@ func printUsage(w io.Writer) error {
 	if _, err := fmt.Fprintln(w, "Usage:"); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch]\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -json JSON|-json @FILE")
+	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch]\n  killswitch-cli notifications [-socket PATH]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -json JSON|-json @FILE")
+	return err
+}
+
+func printNotification(w io.Writer, notification adminapi.Notification) error {
+	if notification.Header == "" {
+		_, err := fmt.Fprintf(w, "[%s] %s\n", notification.Level, notification.Text)
+		return err
+	}
+	_, err := fmt.Fprintf(w, "[%s] %s: %s\n", notification.Level, notification.Header, notification.Text)
 	return err
 }
 

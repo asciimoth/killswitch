@@ -992,24 +992,30 @@ func run(parent context.Context, opts options) error {
 		_ = reader.Close()
 	}()
 
-	errCh := make(chan error, 3)
-	go func() {
-		if err := readBootstrapEvents(reader); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
-			errCh <- err
-		}
-	}()
-
 	manager := newEgressManager(objs.KillswitchEgress)
 	defer manager.close()
 	var reconcileMu sync.Mutex
 
 	var adminServer *adminAPIServer
+	notifyError := func(header string, err error) {
+		if adminServer != nil {
+			adminServer.notifyError(header, err)
+		}
+	}
+
 	configSnapshot := func() adminapi.CurrentConfig {
-		return currentConfigSnapshot(policies, manager, adminServer.clientSnapshot)
+		return currentConfigSnapshot(policies, manager, adminServer.clientSnapshot, notifyError)
 	}
 	adminServer = newAdminAPIServer(opts.AdminAPI, configSnapshot, func(req adminapi.MutationRequest) adminapi.MutationResult {
 		return applyAdminMutation(req, policies, manager, &reconcileMu)
 	})
+
+	errCh := make(chan error, 3)
+	go func() {
+		if err := readBootstrapEvents(reader, notifyError); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
+			errCh <- err
+		}
+	}()
 	adminServer.setTemporaryRulesetCallbacks(
 		func(owner string, req adminapi.MutationRequest) adminapi.MutationResult {
 			return applyTemporaryRulesetMutation(owner, req, policies, manager, &reconcileMu)
@@ -1231,18 +1237,22 @@ func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 		TemporaryRulesets:       apiTemporaryRulesets(tmpRulesets),
 		AdminAPI: adminapi.AdminConfig{
 			SocketPath: opts.AdminAPI.SocketPath,
+			Debug:      opts.AdminAPI.Debug,
 		},
 	}
 }
 
-func currentConfigSnapshot(policies *policyManager, manager *egressManager, clients func() []adminapi.ClientInfo) adminapi.CurrentConfig {
+func currentConfigSnapshot(policies *policyManager, manager *egressManager, clients func() []adminapi.ClientInfo, notifyError func(string, error)) adminapi.CurrentConfig {
 	cfg := policies.configSnapshot()
 	opts := policies.optionsSnapshot()
 	all, err := listInterfaces()
 	if err != nil {
 		log.Printf("ERROR: list interfaces for admin API snapshot: %s", err)
+		if notifyError != nil {
+			notifyError("Admin API snapshot error", err)
+		}
 	} else {
-		cfg.Interfaces = apiInterfaces(all, opts, manager)
+		cfg.Interfaces = apiInterfaces(all, opts, manager, notifyError)
 	}
 	if clients != nil {
 		cfg.Clients = clients()
@@ -1385,7 +1395,7 @@ func apiAddrs(values []netip.Addr) []string {
 	return out
 }
 
-func apiInterfaces(all []interfaceInfo, opts options, manager *egressManager) []adminapi.Interface {
+func apiInterfaces(all []interfaceInfo, opts options, manager *egressManager, notifyError func(string, error)) []adminapi.Interface {
 	if len(all) == 0 {
 		return nil
 	}
@@ -1395,6 +1405,9 @@ func apiInterfaces(all []interfaceInfo, opts options, manager *egressManager) []
 		matched, err := interfaceMatchesSelectors(iface, opts)
 		if err != nil {
 			log.Printf("ERROR: match interface %s(index %d) for admin API snapshot: %s", iface.Name, iface.Index, err)
+			if notifyError != nil {
+				notifyError("Admin API snapshot error", err)
+			}
 		}
 		out = append(out, adminapi.Interface{
 			Index:      iface.Index,
@@ -1769,7 +1782,7 @@ func allowedV6HostportKeys(values []string) ([]hostport6Key, error) {
 	return keys, nil
 }
 
-func readBootstrapEvents(reader *ringbuf.Reader) error {
+func readBootstrapEvents(reader *ringbuf.Reader, notifyError func(string, error)) error {
 	for {
 		record, err := reader.Read()
 		if err != nil {
@@ -1779,6 +1792,9 @@ func readBootstrapEvents(reader *ringbuf.Reader) error {
 		event, err := parseBootstrapEvent(record.RawSample)
 		if err != nil {
 			log.Printf("parse bootstrap event: %s", err)
+			if notifyError != nil {
+				notifyError("Bootstrap event parse error", err)
+			}
 			continue
 		}
 		log.Print(formatBootstrapEvent(event))

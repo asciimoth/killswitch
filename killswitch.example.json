@@ -20,6 +20,7 @@
   ],
   "admin_api": {
     "socket_path": "/run/killswitch/admin.sock",
+    "debug": true,
     "auth": {
       "groupnames": [
         "killswitch",

@@ -31,6 +31,7 @@ const (
 type adminAPIConfig struct {
 	SocketPath string             `json:"socket_path"`
 	Auth       adminAPIAuthConfig `json:"auth"`
+	Debug      bool               `json:"debug"`
 }
 
 type adminAPIAuthConfig struct {
@@ -43,6 +44,7 @@ type adminAPIAuthConfig struct {
 type adminAPIOptions struct {
 	SocketPath string
 	Auth       adminAPIAuthRules
+	Debug      bool
 }
 
 type adminAPIAuthRules struct {
@@ -61,6 +63,7 @@ type adminAPIServer struct {
 	nextConnectionID atomic.Uint64
 	mu               sync.Mutex
 	clients          map[uint64]*adminAPIClient
+	notifications    []adminapi.Notification
 }
 
 type adminAPIPeer struct {
@@ -81,6 +84,7 @@ type adminAPIClient struct {
 func adminAPIOptionsFromConfig(cfg adminAPIConfig) adminAPIOptions {
 	opts := adminAPIOptions{
 		SocketPath: cfg.SocketPath,
+		Debug:      cfg.Debug,
 		Auth: adminAPIAuthRules{
 			UIDs:       cfg.Auth.UIDs,
 			GIDs:       cfg.Auth.GIDs,
@@ -304,6 +308,9 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 		case adminapi.SubscribeRequest:
 			s.setClientSubscriptions(client.id, msg.EventTypes)
 			s.notify(adminapi.EventTypeClients)
+			if eventTypesInclude(msg.EventTypes, adminapi.EventTypeNotification) {
+				s.drainNotifications(client)
+			}
 		case adminapi.MutationRequest:
 			result := s.handleMutation(client.owner, msg)
 			if !result.OK {
@@ -317,6 +324,12 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 			}
 			if result.OK {
 				s.notify(adminapi.EventTypeConfig)
+			}
+		case adminapi.DebugNotifyRequest:
+			result := s.handleDebugNotify(msg)
+			if err := client.send(result); err != nil {
+				log.Printf("Admin API write debug result for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, err)
+				return
 			}
 		case adminapi.UnknownMessage:
 			log.Printf("Admin API ignored unknown message for pid=%d uid=%d gid=%d", peer.PID, peer.UID, peer.GID)
@@ -406,6 +419,99 @@ func (s *adminAPIServer) notify(eventType adminapi.EventType) {
 			log.Printf("Admin API write %s event for pid=%d uid=%d gid=%d: %s", eventType, client.peer.PID, client.peer.UID, client.peer.GID, err)
 		}
 	}
+}
+
+func (s *adminAPIServer) notifyError(header string, err error) {
+	if err == nil {
+		return
+	}
+	s.notifyNotification(adminapi.Notification{
+		Level:  adminapi.NotificationLevelError,
+		Header: header,
+		Text:   err.Error(),
+	})
+}
+
+func (s *adminAPIServer) notifyNotification(notification adminapi.Notification) {
+	if err := validateNotification(notification); err != nil {
+		log.Printf("Admin API ignored invalid notification: %s", err)
+		return
+	}
+
+	s.mu.Lock()
+	clients := make([]*adminAPIClient, 0, len(s.clients))
+	for _, client := range s.clients {
+		if client.eventTypes[adminapi.EventTypeNotification] {
+			clients = append(clients, client)
+		}
+	}
+	if len(clients) == 0 {
+		s.bufferNotificationLocked(notification)
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
+	msg := adminapi.EventMessage{EventType: adminapi.EventTypeNotification, Notification: notification}
+	for _, client := range clients {
+		if err := client.send(msg); err != nil {
+			log.Printf("Admin API write notification event for pid=%d uid=%d gid=%d: %s", client.peer.PID, client.peer.UID, client.peer.GID, err)
+		}
+	}
+}
+
+func (s *adminAPIServer) bufferNotificationLocked(notification adminapi.Notification) {
+	s.notifications = append(s.notifications, notification)
+}
+
+func (s *adminAPIServer) drainNotifications(client *adminAPIClient) {
+	s.mu.Lock()
+	if len(s.notifications) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	notifications := append([]adminapi.Notification(nil), s.notifications...)
+	s.notifications = nil
+	s.mu.Unlock()
+
+	for _, notification := range notifications {
+		if err := client.send(adminapi.EventMessage{EventType: adminapi.EventTypeNotification, Notification: notification}); err != nil {
+			log.Printf("Admin API write buffered notification event for pid=%d uid=%d gid=%d: %s", client.peer.PID, client.peer.UID, client.peer.GID, err)
+			return
+		}
+	}
+}
+
+func (s *adminAPIServer) handleDebugNotify(req adminapi.DebugNotifyRequest) adminapi.DebugResult {
+	if !s.opts.Debug {
+		return adminapi.DebugResult{OK: false, Error: "debug admin API is disabled"}
+	}
+	if err := validateNotification(req.Notification); err != nil {
+		return adminapi.DebugResult{OK: false, Error: err.Error()}
+	}
+	s.notifyNotification(req.Notification)
+	return adminapi.DebugResult{OK: true}
+}
+
+func validateNotification(notification adminapi.Notification) error {
+	switch notification.Level {
+	case adminapi.NotificationLevelNormal, adminapi.NotificationLevelWarn, adminapi.NotificationLevelError:
+	default:
+		return fmt.Errorf("notification level must be one of normal, warn, or error, got %q", notification.Level)
+	}
+	if notification.Text == "" {
+		return errors.New("notification text is required")
+	}
+	return nil
+}
+
+func eventTypesInclude(values []adminapi.EventType, needle adminapi.EventType) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *adminAPIClient) send(msg adminapi.Message) error {

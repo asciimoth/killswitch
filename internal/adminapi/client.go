@@ -88,6 +88,18 @@ func (c *Client) WaitForEvent() (EventMessage, error) {
 	}
 }
 
+func (c *Client) WaitForNotification() (Notification, error) {
+	for {
+		event, err := c.WaitForEvent()
+		if err != nil {
+			return Notification{}, err
+		}
+		if event.EventType == EventTypeNotification {
+			return event.Notification, nil
+		}
+	}
+}
+
 func (c *Client) Mutate(req MutationRequest) (MutationResult, error) {
 	if err := c.Send(req); err != nil {
 		return MutationResult{}, err
@@ -105,6 +117,28 @@ func (c *Client) WaitForMutationResult() (MutationResult, error) {
 			return MutationResult{}, fmt.Errorf("read admin API message: %w", err)
 		}
 		if result, ok := msg.(MutationResult); ok {
+			return result, nil
+		}
+	}
+}
+
+func (c *Client) DebugNotify(notification Notification) (DebugResult, error) {
+	if err := c.Send(DebugNotifyRequest{Notification: notification}); err != nil {
+		return DebugResult{}, err
+	}
+	return c.WaitForDebugResult()
+}
+
+func (c *Client) WaitForDebugResult() (DebugResult, error) {
+	for {
+		msg, err := c.Receive()
+		if err != nil {
+			if IsEOF(err) {
+				return DebugResult{}, errors.New("connection closed before debug result was received")
+			}
+			return DebugResult{}, fmt.Errorf("read admin API message: %w", err)
+		}
+		if result, ok := msg.(DebugResult); ok {
 			return result, nil
 		}
 	}

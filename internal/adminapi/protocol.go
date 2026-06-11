@@ -17,6 +17,8 @@ const (
 	MessageTypeEvent          MessageType = "event"
 	MessageTypeMutation       MessageType = "mutation"
 	MessageTypeMutationResult MessageType = "mutation_result"
+	MessageTypeDebugNotify    MessageType = "debug_notify"
+	MessageTypeDebugResult    MessageType = "debug_result"
 )
 
 type Envelope struct {
@@ -45,9 +47,10 @@ func (ConfigMessage) messageType() MessageType {
 type EventType string
 
 const (
-	EventTypeConfig     EventType = "config"
-	EventTypeInterfaces EventType = "interfaces"
-	EventTypeClients    EventType = "clients"
+	EventTypeConfig       EventType = "config"
+	EventTypeInterfaces   EventType = "interfaces"
+	EventTypeClients      EventType = "clients"
+	EventTypeNotification EventType = "notification"
 )
 
 type SubscribeRequest struct {
@@ -59,12 +62,44 @@ func (SubscribeRequest) messageType() MessageType {
 }
 
 type EventMessage struct {
-	EventType EventType     `json:"event_type"`
-	Config    CurrentConfig `json:"config"`
+	EventType    EventType     `json:"event_type"`
+	Config       CurrentConfig `json:"config,omitempty"`
+	Notification Notification  `json:"notification,omitempty"`
 }
 
 func (EventMessage) messageType() MessageType {
 	return MessageTypeEvent
+}
+
+type NotificationLevel string
+
+const (
+	NotificationLevelNormal NotificationLevel = "normal"
+	NotificationLevelWarn   NotificationLevel = "warn"
+	NotificationLevelError  NotificationLevel = "error"
+)
+
+type Notification struct {
+	Level  NotificationLevel `json:"level"`
+	Text   string            `json:"text"`
+	Header string            `json:"header,omitempty"`
+}
+
+type DebugNotifyRequest struct {
+	Notification Notification `json:"notification"`
+}
+
+func (DebugNotifyRequest) messageType() MessageType {
+	return MessageTypeDebugNotify
+}
+
+type DebugResult struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+func (DebugResult) messageType() MessageType {
+	return MessageTypeDebugResult
 }
 
 type MutationOperation string
@@ -146,6 +181,7 @@ type ClientInfo struct {
 
 type AdminConfig struct {
 	SocketPath string `json:"socket_path"`
+	Debug      bool   `json:"debug"`
 }
 
 type AllowRules struct {
@@ -242,6 +278,18 @@ func ReadMessage(decoder *json.Decoder) (Message, error) {
 			return nil, err
 		}
 		return msg, nil
+	case MessageTypeDebugNotify:
+		var msg DebugNotifyRequest
+		if err := decodePayload(envelope.Payload, &msg); err != nil {
+			return nil, err
+		}
+		return msg, nil
+	case MessageTypeDebugResult:
+		var msg DebugResult
+		if err := decodePayload(envelope.Payload, &msg); err != nil {
+			return nil, err
+		}
+		return msg, nil
 	default:
 		return UnknownMessage(envelope), nil
 	}
@@ -272,6 +320,14 @@ func messagePayload(msg Message) (json.RawMessage, error) {
 	case MutationResult:
 		return json.Marshal(typed)
 	case *MutationResult:
+		return json.Marshal(typed)
+	case DebugNotifyRequest:
+		return json.Marshal(typed)
+	case *DebugNotifyRequest:
+		return json.Marshal(typed)
+	case DebugResult:
+		return json.Marshal(typed)
+	case *DebugResult:
 		return json.Marshal(typed)
 	default:
 		return nil, fmt.Errorf("unsupported admin API message type %T", msg)
