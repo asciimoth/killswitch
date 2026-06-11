@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -94,4 +95,96 @@ func TestWaitForStopInputStopsOnEscapeAndEOF(t *testing.T) {
 	if err := waitForStopInput(strings.NewReader("")); err != nil {
 		t.Fatalf("eof stop: %v", err)
 	}
+}
+
+func TestMutationRequestFromArgsAddsNamedRuleset(t *testing.T) {
+	raw := `{"priority":100,"trigger":{"interface_names":["wg0"]},"policy":{"enable_v4":true}}`
+	req, socketPath, err := mutationRequestFromArgs(adminapi.MutationAdd, []string{
+		"-socket", "/tmp/killswitch-test.sock",
+		"-target", "ruleset",
+		"-ruleset", "wireguard-up",
+		"-json", raw,
+	}, ioDiscard{})
+	if err != nil {
+		t.Fatalf("mutation request: %v", err)
+	}
+	if socketPath != "/tmp/killswitch-test.sock" {
+		t.Fatalf("socket path = %q", socketPath)
+	}
+	if req.Operation != adminapi.MutationAdd || req.Target != "ruleset" || req.Ruleset != "wireguard-up" {
+		t.Fatalf("request metadata = %+v", req)
+	}
+	if len(req.Values) != 0 {
+		t.Fatalf("values = %+v", req.Values)
+	}
+	if !json.Valid(req.Value) || string(req.Value) != raw {
+		t.Fatalf("value = %s", req.Value)
+	}
+}
+
+func TestMutationRequestFromArgsRemovesNamedRuleset(t *testing.T) {
+	req, _, err := mutationRequestFromArgs(adminapi.MutationRemove, []string{
+		"-target", "ruleset",
+		"-ruleset", "wireguard-up",
+	}, ioDiscard{})
+	if err != nil {
+		t.Fatalf("mutation request: %v", err)
+	}
+	if req.Operation != adminapi.MutationRemove || req.Target != "ruleset" || req.Ruleset != "wireguard-up" {
+		t.Fatalf("request metadata = %+v", req)
+	}
+	if len(req.Values) != 0 || len(req.Value) != 0 {
+		t.Fatalf("unexpected request payload: values=%+v value=%s", req.Values, req.Value)
+	}
+}
+
+func TestMutationRequestFromArgsValidatesWholeRulesetMutations(t *testing.T) {
+	tests := []struct {
+		name string
+		op   adminapi.MutationOperation
+		args []string
+		want string
+	}{
+		{
+			name: "add requires json",
+			op:   adminapi.MutationAdd,
+			args: []string{"-target", "ruleset", "-ruleset", "wireguard-up"},
+			want: "add -target ruleset requires -json JSON or -json @FILE",
+		},
+		{
+			name: "remove rejects json",
+			op:   adminapi.MutationRemove,
+			args: []string{"-target", "ruleset", "-ruleset", "wireguard-up", "-json", "{}"},
+			want: "remove -target ruleset does not accept -json",
+		},
+		{
+			name: "remove rejects values",
+			op:   adminapi.MutationRemove,
+			args: []string{"-target", "ruleset", "-ruleset", "wireguard-up", "extra"},
+			want: "remove -target ruleset expects no positional arguments, got: extra",
+		},
+		{
+			name: "requires name",
+			op:   adminapi.MutationRemove,
+			args: []string{"-target", "ruleset"},
+			want: "ruleset mutations require -ruleset NAME",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := mutationRequestFromArgs(tt.op, tt.args, ioDiscard{})
+			if err == nil {
+				t.Fatal("mutation request succeeded, expected error")
+			}
+			if err.Error() != tt.want {
+				t.Fatalf("error = %q, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+type ioDiscard struct{}
+
+func (ioDiscard) Write(p []byte) (int, error) {
+	return len(p), nil
 }

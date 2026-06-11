@@ -354,45 +354,12 @@ func waitForStopInput(r io.Reader) error {
 }
 
 func runMutation(op adminapi.MutationOperation, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet(string(op), flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
-	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
-	target := flags.String("target", "", "mutation target")
-	flags.StringVar(target, "t", "", "mutation target")
-	ruleset := flags.String("ruleset", "", "ruleset name for ruleset mutations")
-	flags.StringVar(ruleset, "r", "", "ruleset name for ruleset mutations")
-	jsonValue := flags.String("json", "", "JSON value for boolean, policy, or ruleset set operations; prefix with @ to read a file")
-	if err := flags.Parse(args); err != nil {
+	req, socketPath, err := mutationRequestFromArgs(op, args, stderr)
+	if err != nil {
 		return err
 	}
-	if *target == "" {
-		return fmt.Errorf("%s requires -target", op)
-	}
 
-	req := adminapi.MutationRequest{
-		Operation: op,
-		Target:    *target,
-		Ruleset:   *ruleset,
-		Values:    flags.Args(),
-	}
-	if *jsonValue != "" {
-		raw, err := readJSONArgument(*jsonValue)
-		if err != nil {
-			return err
-		}
-		req.Value = raw
-	}
-	if len(req.Value) == 0 && op == adminapi.MutationSet && len(req.Values) == 1 && scalarTarget(*target) {
-		raw, err := scalarJSONValue(req.Values[0])
-		if err != nil {
-			return err
-		}
-		req.Value = raw
-		req.Values = nil
-	}
-
-	client, err := adminapi.DialUnix(context.Background(), *socketPath)
+	client, err := adminapi.DialUnix(context.Background(), socketPath)
 	if err != nil {
 		return err
 	}
@@ -411,6 +378,75 @@ func runMutation(op adminapi.MutationOperation, args []string, stdout, stderr io
 		_, err = fmt.Fprintln(stdout, "unchanged")
 	}
 	return err
+}
+
+func mutationRequestFromArgs(op adminapi.MutationOperation, args []string, stderr io.Writer) (adminapi.MutationRequest, string, error) {
+	flags := flag.NewFlagSet(string(op), flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	target := flags.String("target", "", "mutation target")
+	flags.StringVar(target, "t", "", "mutation target")
+	ruleset := flags.String("ruleset", "", "ruleset name for ruleset mutations")
+	flags.StringVar(ruleset, "r", "", "ruleset name for ruleset mutations")
+	jsonValue := flags.String("json", "", "JSON value for boolean, policy, or ruleset add/set operations; prefix with @ to read a file")
+	if err := flags.Parse(args); err != nil {
+		return adminapi.MutationRequest{}, "", err
+	}
+	if *target == "" {
+		return adminapi.MutationRequest{}, "", fmt.Errorf("%s requires -target", op)
+	}
+
+	req := adminapi.MutationRequest{
+		Operation: op,
+		Target:    *target,
+		Ruleset:   *ruleset,
+		Values:    flags.Args(),
+	}
+	if *jsonValue != "" {
+		raw, err := readJSONArgument(*jsonValue)
+		if err != nil {
+			return adminapi.MutationRequest{}, "", err
+		}
+		req.Value = raw
+	}
+	if len(req.Value) == 0 && op == adminapi.MutationSet && len(req.Values) == 1 && scalarTarget(*target) {
+		raw, err := scalarJSONValue(req.Values[0])
+		if err != nil {
+			return adminapi.MutationRequest{}, "", err
+		}
+		req.Value = raw
+		req.Values = nil
+	}
+	if err := validateMutationRequest(req, *jsonValue != ""); err != nil {
+		return adminapi.MutationRequest{}, "", err
+	}
+	return req, *socketPath, nil
+}
+
+func validateMutationRequest(req adminapi.MutationRequest, hasJSON bool) error {
+	if req.Target != "ruleset" {
+		return nil
+	}
+	if req.Ruleset == "" {
+		return errors.New("ruleset mutations require -ruleset NAME")
+	}
+	if len(req.Values) > 0 {
+		return fmt.Errorf("%s -target ruleset expects no positional arguments, got: %s", req.Operation, strings.Join(req.Values, " "))
+	}
+	switch req.Operation {
+	case adminapi.MutationAdd, adminapi.MutationSet:
+		if !hasJSON {
+			return fmt.Errorf("%s -target ruleset requires -json JSON or -json @FILE", req.Operation)
+		}
+	case adminapi.MutationRemove:
+		if hasJSON {
+			return errors.New("remove -target ruleset does not accept -json")
+		}
+	default:
+		return fmt.Errorf("unsupported ruleset operation %q", req.Operation)
+	}
+	return nil
 }
 
 func readJSONArgument(value string) (json.RawMessage, error) {
@@ -531,7 +567,7 @@ func printUsage(w io.Writer) error {
 	if _, err := fmt.Fprintln(w, "Usage:"); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch]\n  killswitch-cli notifications [-socket PATH]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -json JSON|-json @FILE\n  killswitch-cli force-ruleset [-socket PATH] -ruleset NAME")
+	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch]\n  killswitch-cli notifications [-socket PATH]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target ruleset -ruleset NAME\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -json JSON|-json @FILE\n  killswitch-cli force-ruleset [-socket PATH] -ruleset NAME")
 	return err
 }
 

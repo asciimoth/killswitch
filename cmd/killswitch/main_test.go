@@ -814,6 +814,37 @@ func TestMutateOptionsSetsWholeRuleset(t *testing.T) {
 	}
 }
 
+func TestMutateOptionsAddsAndRemovesWholeRuleset(t *testing.T) {
+	next, err := mutateOptions(options{InterfaceNames: []string{"eth0"}}, adminapi.MutationRequest{
+		Operation: adminapi.MutationAdd,
+		Target:    "ruleset",
+		Ruleset:   "office",
+		RulesetDef: &adminapi.RulesetMutation{
+			Priority: 20,
+			Trigger:  adminapi.RulesetTrigger{InterfaceNames: []string{"wg0"}},
+			Policy:   adminapi.AllowRules{EnableV4: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("add ruleset: %v", err)
+	}
+	if len(next.Rulesets) != 1 || next.Rulesets[0].Name != "office" || !next.Rulesets[0].EnableV4 {
+		t.Fatalf("rulesets after add = %+v", next.Rulesets)
+	}
+
+	next, err = mutateOptions(next, adminapi.MutationRequest{
+		Operation: adminapi.MutationRemove,
+		Target:    "ruleset",
+		Ruleset:   "office",
+	})
+	if err != nil {
+		t.Fatalf("remove ruleset: %v", err)
+	}
+	if len(next.Rulesets) != 0 {
+		t.Fatalf("rulesets after remove = %+v", next.Rulesets)
+	}
+}
+
 func TestMutateOptionsSetsRulesetDisabled(t *testing.T) {
 	next, err := mutateOptions(options{
 		InterfaceNames: []string{"eth0"},
