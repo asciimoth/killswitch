@@ -32,6 +32,15 @@ func TestPrintConfigIncludesTemporaryRulesets(t *testing.T) {
 				},
 			},
 		},
+		Rulesets: []adminapi.Ruleset{
+			{
+				Name:     "office",
+				Disabled: true,
+				Priority: 20,
+				Trigger:  adminapi.RulesetTrigger{InterfaceNames: []string{"wg0"}},
+				Policy:   adminapi.AllowRules{EnableV4: true},
+			},
+		},
 		Clients: []adminapi.ClientInfo{
 			{
 				ID:         1,
@@ -54,6 +63,9 @@ func TestPrintConfigIncludesTemporaryRulesets(t *testing.T) {
 		"client=pid=100 uid=1000 gid=1000 conn=1",
 		"allowed v6 hosts:",
 		"2001:db8::10",
+		"Rulesets",
+		"office:",
+		"disabled=true",
 		"wg0:",
 		"matched=true",
 		"killswitch=true",

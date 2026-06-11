@@ -130,6 +130,7 @@ type allowRules struct {
 
 type ruleset struct {
 	Name     string
+	Disabled bool
 	Priority int
 	MatchAll bool
 	Trigger  rulesetTrigger
@@ -164,6 +165,7 @@ type configFile struct {
 }
 
 type rulesetConfig struct {
+	Disabled       bool          `json:"disabled"`
 	Priority       int           `json:"priority"`
 	Match          string        `json:"match"`
 	MatchAll       bool          `json:"match_all"`
@@ -358,6 +360,7 @@ func rulesetsFromConfig(configs map[string]rulesetConfig) ([]ruleset, error) {
 
 		rulesets = append(rulesets, ruleset{
 			Name:       name,
+			Disabled:   cfg.Disabled,
 			Priority:   cfg.Priority,
 			MatchAll:   matchAll,
 			Trigger:    trigger,
@@ -691,6 +694,10 @@ func mutateRulesetField(rulesets *[]ruleset, field string, req adminapi.Mutation
 	}
 	rs := (*rulesets)[idx]
 	switch field {
+	case "disabled":
+		if err := mutateBool(&rs.Disabled, req); err != nil {
+			return err
+		}
 	case "priority":
 		if req.Operation != adminapi.MutationSet {
 			return errors.New("ruleset priority only supports set")
@@ -815,7 +822,7 @@ func rulesetFromAPI(name string, rulesetPtr *adminapi.RulesetMutation, raw json.
 	if err != nil {
 		return ruleset{}, err
 	}
-	return ruleset{Name: name, Priority: api.Priority, MatchAll: api.MatchAll, Trigger: trigger, allowRules: rules}, nil
+	return ruleset{Name: name, Disabled: api.Disabled, Priority: api.Priority, MatchAll: api.MatchAll, Trigger: trigger, allowRules: rules}, nil
 }
 
 func validateRegexps(field string, values []string) error {
@@ -908,6 +915,7 @@ func cloneOptions(opts options) options {
 	for i, rs := range opts.Rulesets {
 		out.Rulesets[i] = ruleset{
 			Name:       rs.Name,
+			Disabled:   rs.Disabled,
 			Priority:   rs.Priority,
 			MatchAll:   rs.MatchAll,
 			Trigger:    cloneRulesetTrigger(rs.Trigger),
@@ -1284,7 +1292,8 @@ func apiRulesets(rulesets []ruleset, activeName string) []adminapi.Ruleset {
 	for _, ruleset := range rulesets {
 		out = append(out, adminapi.Ruleset{
 			Name:     ruleset.Name,
-			Active:   ruleset.Name == activeName,
+			Active:   !ruleset.Disabled && ruleset.Name == activeName,
+			Disabled: ruleset.Disabled,
 			Priority: ruleset.Priority,
 			MatchAll: ruleset.MatchAll,
 			Trigger: adminapi.RulesetTrigger{
@@ -1445,6 +1454,9 @@ func activeRuleset(all []interfaceInfo, rulesets []ruleset) *ruleset {
 	var active *ruleset
 	for i := range rulesets {
 		ruleset := &rulesets[i]
+		if ruleset.Disabled {
+			continue
+		}
 		if !rulesetTriggerMatches(all, ruleset.Trigger, ruleset.MatchAll) {
 			continue
 		}

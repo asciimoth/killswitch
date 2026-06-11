@@ -110,6 +110,7 @@ func TestConfigToOptionsParsesRulesets(t *testing.T) {
 		AllowedPorts:   []string{"tcp/443"},
 		Rulesets: map[string]rulesetConfig{
 			"office": {
+				Disabled:       true,
 				Priority:       20,
 				Match:          "and",
 				Trigger:        triggerConfig{InterfaceNames: []string{"wg0"}, IPAddrs: []string{"10.64.0.2"}},
@@ -126,7 +127,7 @@ func TestConfigToOptionsParsesRulesets(t *testing.T) {
 		t.Fatalf("rulesets count = %d", len(opts.Rulesets))
 	}
 	ruleset := opts.Rulesets[0]
-	if ruleset.Name != "office" || ruleset.Priority != 20 || !ruleset.MatchAll {
+	if ruleset.Name != "office" || !ruleset.Disabled || ruleset.Priority != 20 || !ruleset.MatchAll {
 		t.Fatalf("unexpected ruleset metadata: %+v", ruleset)
 	}
 	if len(ruleset.Trigger.InterfaceNames) != 1 || ruleset.Trigger.InterfaceNames[0] != "wg0" {
@@ -327,6 +328,26 @@ func TestActiveRulesetSelectsHighestPriorityCandidate(t *testing.T) {
 
 	active := activeRuleset(all, rulesets)
 	if active == nil || active.Name != "high" {
+		t.Fatalf("active ruleset = %+v", active)
+	}
+}
+
+func TestActiveRulesetIgnoresDisabledRulesets(t *testing.T) {
+	all := []interfaceInfo{
+		{Name: "wg0", Index: 3, Type: "wireguard", Addrs: []netip.Addr{netipMustParse("10.64.0.2")}},
+	}
+	rulesets := []ruleset{
+		{Name: "disabled", Disabled: true, Priority: 100, Trigger: rulesetTrigger{InterfaceNames: []string{"wg0"}}},
+		{Name: "enabled", Priority: 10, Trigger: rulesetTrigger{InterfaceNames: []string{"wg0"}}},
+	}
+
+	active := activeRuleset(all, rulesets)
+	if active == nil || active.Name != "enabled" {
+		t.Fatalf("active ruleset = %+v", active)
+	}
+
+	rulesets[1].Disabled = true
+	if active := activeRuleset(all, rulesets); active != nil {
 		t.Fatalf("active ruleset = %+v", active)
 	}
 }
@@ -568,6 +589,7 @@ func TestPolicyManagerConfigSnapshotMarksActiveRuleset(t *testing.T) {
 				},
 				{
 					Name:       "home",
+					Disabled:   true,
 					Priority:   10,
 					Trigger:    rulesetTrigger{InterfaceNames: []string{"tun0"}},
 					allowRules: allowRules{EnableV6: true},
@@ -592,8 +614,20 @@ func TestPolicyManagerConfigSnapshotMarksActiveRuleset(t *testing.T) {
 	if cfg.Rulesets[1].Active {
 		t.Fatalf("home ruleset is marked active: %+v", cfg.Rulesets[1])
 	}
+	if !cfg.Rulesets[1].Disabled {
+		t.Fatalf("home ruleset disabled flag is missing: %+v", cfg.Rulesets[1])
+	}
 	if !cfg.Rulesets[0].Policy.EnableV4 || !cfg.Rulesets[1].Policy.EnableV6 {
 		t.Fatalf("ruleset policies were not included: %+v", cfg.Rulesets)
+	}
+}
+
+func TestAPIRulesetsNeverMarksDisabledRulesetActive(t *testing.T) {
+	rulesets := apiRulesets([]ruleset{
+		{Name: "office", Disabled: true, Trigger: rulesetTrigger{InterfaceNames: []string{"wg0"}}},
+	}, "office")
+	if len(rulesets) != 1 || rulesets[0].Active || !rulesets[0].Disabled {
+		t.Fatalf("rulesets = %+v", rulesets)
 	}
 }
 
@@ -660,6 +694,7 @@ func TestMutateOptionsSetsWholeRuleset(t *testing.T) {
 		Target:    "ruleset",
 		Ruleset:   "office",
 		RulesetDef: &adminapi.RulesetMutation{
+			Disabled: true,
 			Priority: 20,
 			MatchAll: true,
 			Trigger: adminapi.RulesetTrigger{
@@ -676,11 +711,36 @@ func TestMutateOptionsSetsWholeRuleset(t *testing.T) {
 		t.Fatalf("rulesets = %+v", next.Rulesets)
 	}
 	ruleset := next.Rulesets[0]
-	if ruleset.Name != "office" || ruleset.Priority != 20 || !ruleset.MatchAll || !ruleset.EnableV6 {
+	if ruleset.Name != "office" || !ruleset.Disabled || ruleset.Priority != 20 || !ruleset.MatchAll || !ruleset.EnableV6 {
 		t.Fatalf("ruleset = %+v", ruleset)
 	}
 	if len(ruleset.Trigger.IPAddrs) != 1 || ruleset.Trigger.IPAddrs[0] != netipMustParse("10.64.0.2") {
 		t.Fatalf("trigger = %+v", ruleset.Trigger)
+	}
+}
+
+func TestMutateOptionsSetsRulesetDisabled(t *testing.T) {
+	next, err := mutateOptions(options{
+		InterfaceNames: []string{"eth0"},
+		Rulesets: []ruleset{
+			{
+				Name:       "office",
+				Priority:   20,
+				Trigger:    rulesetTrigger{InterfaceNames: []string{"wg0"}},
+				allowRules: allowRules{EnableV6: true},
+			},
+		},
+	}, adminapi.MutationRequest{
+		Operation: adminapi.MutationSet,
+		Target:    "ruleset.disabled",
+		Ruleset:   "office",
+		Value:     json.RawMessage(`true`),
+	})
+	if err != nil {
+		t.Fatalf("mutate options: %v", err)
+	}
+	if len(next.Rulesets) != 1 || !next.Rulesets[0].Disabled {
+		t.Fatalf("rulesets = %+v", next.Rulesets)
 	}
 }
 

@@ -22,6 +22,9 @@ notifications: build
 debug-notify level="error" text="debug notification" header="Debug": build
   ./killswitch-cli debug-notify -level '{{level}}' -header '{{header}}' -text '{{text}}'
 
+disable: build
+  ./killswitch-cli set -target ruleset.disabled -ruleset wireguard-up true
+
 cli-add: build
   ./killswitch-cli add -target base_policy.allowed_ports tcp/443
 

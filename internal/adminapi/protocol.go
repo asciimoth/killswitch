@@ -199,6 +199,7 @@ type AllowRules struct {
 type Ruleset struct {
 	Name     string         `json:"name"`
 	Active   bool           `json:"active"`
+	Disabled bool           `json:"disabled"`
 	Priority int            `json:"priority"`
 	MatchAll bool           `json:"match_all"`
 	Trigger  RulesetTrigger `json:"trigger"`
@@ -211,6 +212,7 @@ type TmpRuleset struct {
 }
 
 type RulesetMutation struct {
+	Disabled bool           `json:"disabled"`
 	Priority int            `json:"priority"`
 	MatchAll bool           `json:"match_all"`
 	Trigger  RulesetTrigger `json:"trigger"`

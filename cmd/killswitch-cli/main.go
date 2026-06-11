@@ -351,7 +351,7 @@ func readJSONArgument(value string) (json.RawMessage, error) {
 func scalarTarget(target string) bool {
 	switch target {
 	case "base_policy.allow_all", "base_policy.enable_v4", "base_policy.enable_v6",
-		"ruleset.match_all", "ruleset.priority":
+		"ruleset.disabled", "ruleset.match_all", "ruleset.priority":
 		return true
 	default:
 		return false
@@ -509,7 +509,7 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 		printer.println()
 		printer.println("Rulesets")
 		for _, ruleset := range cfg.Rulesets {
-			printer.printf("  %s:\tactive=%t priority=%d match_all=%t\n", ruleset.Name, ruleset.Active, ruleset.Priority, ruleset.MatchAll)
+			printer.printf("  %s:\tactive=%t disabled=%t priority=%d match_all=%t\n", ruleset.Name, ruleset.Active, ruleset.Disabled, ruleset.Priority, ruleset.MatchAll)
 			printer.printList("    trigger types", ruleset.Trigger.InterfaceTypes)
 			printer.printList("    trigger names", ruleset.Trigger.InterfaceNames)
 			printer.printList("    trigger regexps", ruleset.Trigger.InterfaceRegexps)
