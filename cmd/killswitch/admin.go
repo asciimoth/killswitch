@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -15,11 +16,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asciimoth/killswitch/internal/adminapi"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	defaultAdminAPISocketPath = "/run/killswitch/admin.sock"
+	defaultAdminAPISocketPath = adminapi.DefaultSocketPath
 	defaultAdminAPIGroup      = "killswitch"
 )
 
@@ -48,7 +50,8 @@ type adminAPIAuthRules struct {
 }
 
 type adminAPIServer struct {
-	opts adminAPIOptions
+	opts           adminAPIOptions
+	configSnapshot func() adminapi.CurrentConfig
 }
 
 type adminAPIPeer struct {
@@ -96,8 +99,11 @@ func validateAdminAPIOptions(opts adminAPIOptions) error {
 	return nil
 }
 
-func newAdminAPIServer(opts adminAPIOptions) *adminAPIServer {
-	return &adminAPIServer{opts: opts}
+func newAdminAPIServer(opts adminAPIOptions, configSnapshot func() adminapi.CurrentConfig) *adminAPIServer {
+	if configSnapshot == nil {
+		configSnapshot = func() adminapi.CurrentConfig { return adminapi.CurrentConfig{} }
+	}
+	return &adminAPIServer{opts: opts, configSnapshot: configSnapshot}
 }
 
 func (s *adminAPIServer) listenAndServe(ctx context.Context) error {
@@ -233,6 +239,31 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 	}
 
 	log.Printf("Admin API connection authorized: pid=%d uid=%d gid=%d rule=%s", peer.PID, peer.UID, peer.GID, reason)
+
+	decoder := json.NewDecoder(conn)
+	encoder := json.NewEncoder(conn)
+	for {
+		msg, err := adminapi.ReadMessage(decoder)
+		if err != nil {
+			if adminapi.IsEOF(err) {
+				return
+			}
+			log.Printf("Admin API read error for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, err)
+			return
+		}
+
+		switch msg.(type) {
+		case adminapi.ConfigRequest:
+			if err := adminapi.WriteMessage(encoder, adminapi.ConfigMessage{Config: s.configSnapshot()}); err != nil {
+				log.Printf("Admin API write config for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, err)
+				return
+			}
+		case adminapi.UnknownMessage:
+			log.Printf("Admin API ignored unknown message for pid=%d uid=%d gid=%d", peer.PID, peer.UID, peer.GID)
+		default:
+			log.Printf("Admin API ignored unexpected client message %T for pid=%d uid=%d gid=%d", msg, peer.PID, peer.UID, peer.GID)
+		}
+	}
 }
 
 func adminAPIPeerCred(conn *net.UnixConn) (adminAPIPeer, error) {

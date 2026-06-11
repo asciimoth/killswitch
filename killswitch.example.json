@@ -22,7 +22,8 @@
     "socket_path": "/run/killswitch/admin.sock",
     "auth": {
       "groupnames": [
-        "killswitch"
+        "killswitch",
+        "wheel"
       ]
     }
   },
@@ -52,12 +53,13 @@
   "enable_v4": true,
   "enable_v6": true,
   "allowed_marks": [
+    "0xeb9f0001",
     "0x42",
     "100"
   ],
   "allowed_ports": [
-    "tcp/443",
-    "udp/51820"
+    "tcp/53",
+    "udp/53"
   ],
   "allowed_v4_hosts": [
     "198.51.100.10",

@@ -404,6 +404,47 @@ func TestPolicyManagerSkipsUnchangedEffectiveRules(t *testing.T) {
 	}
 }
 
+func TestPolicyManagerConfigSnapshotMarksActiveRuleset(t *testing.T) {
+	manager := &policyManager{
+		opts: options{
+			Rulesets: []ruleset{
+				{
+					Name:       "office",
+					Priority:   20,
+					Trigger:    rulesetTrigger{InterfaceNames: []string{"wg0"}},
+					allowRules: allowRules{EnableV4: true},
+				},
+				{
+					Name:       "home",
+					Priority:   10,
+					Trigger:    rulesetTrigger{InterfaceNames: []string{"tun0"}},
+					allowRules: allowRules{EnableV6: true},
+				},
+			},
+		},
+		current:    allowRules{EnableV4: true},
+		activeName: "office",
+		set:        true,
+	}
+
+	cfg := manager.configSnapshot()
+	if cfg.ActiveRuleset != "office" {
+		t.Fatalf("active ruleset = %q", cfg.ActiveRuleset)
+	}
+	if len(cfg.Rulesets) != 2 {
+		t.Fatalf("rulesets count = %d", len(cfg.Rulesets))
+	}
+	if !cfg.Rulesets[0].Active {
+		t.Fatalf("office ruleset is not marked active: %+v", cfg.Rulesets[0])
+	}
+	if cfg.Rulesets[1].Active {
+		t.Fatalf("home ruleset is marked active: %+v", cfg.Rulesets[1])
+	}
+	if !cfg.Rulesets[0].Policy.EnableV4 || !cfg.Rulesets[1].Policy.EnableV6 {
+		t.Fatalf("ruleset policies were not included: %+v", cfg.Rulesets)
+	}
+}
+
 func TestShouldReconcileLinkUpdateIgnoresUnchangedSelectedInterface(t *testing.T) {
 	manager := newEgressManager(nil)
 	manager.attached[4] = attachedInterface{info: interfaceInfo{Name: "wlp0s20f3", Index: 4, Type: "device"}}

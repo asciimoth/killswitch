@@ -19,8 +19,10 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
+	"github.com/asciimoth/killswitch/internal/adminapi"
 	"github.com/asciimoth/killswitch/internal/policy"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -202,10 +204,12 @@ type egressManager struct {
 }
 
 type policyManager struct {
-	objs    *killswitchObjects
-	opts    options
-	current allowRules
-	set     bool
+	mu         sync.Mutex
+	objs       *killswitchObjects
+	opts       options
+	current    allowRules
+	activeName string
+	set        bool
 }
 
 func main() {
@@ -472,7 +476,7 @@ func run(parent context.Context, opts options) error {
 		}
 	}()
 
-	adminServer := newAdminAPIServer(opts.AdminAPI)
+	adminServer := newAdminAPIServer(opts.AdminAPI, policies.configSnapshot)
 	go func() {
 		if err := adminServer.listenAndServe(ctx); err != nil {
 			errCh <- err
@@ -597,7 +601,10 @@ func (m *policyManager) reconcile(all []interfaceInfo, logChange bool) (bool, er
 	}
 	effective = canonicalAllowRules(effective)
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.set && allowRulesEqual(m.current, effective) {
+		m.activeName = activeName
 		return false, nil
 	}
 
@@ -605,11 +612,151 @@ func (m *policyManager) reconcile(all []interfaceInfo, logChange bool) (bool, er
 		return false, err
 	}
 	m.current = effective
+	m.activeName = activeName
 	m.set = true
 	if logChange {
 		logPolicy(activeName, effective)
 	}
 	return true, nil
+}
+
+func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
+	m.mu.Lock()
+	current := m.current
+	activeName := m.activeName
+	set := m.set
+	m.mu.Unlock()
+
+	if !set {
+		current = m.opts.allowRules
+	}
+	return adminapi.CurrentConfig{
+		InterfaceTypes:          cloneStrings(m.opts.InterfaceTypes),
+		InterfaceNames:          cloneStrings(m.opts.InterfaceNames),
+		InterfaceRegexps:        cloneStrings(m.opts.InterfaceRegexps),
+		IgnoredInterfaceTypes:   cloneStrings(m.opts.IgnoredInterfaceTypes),
+		IgnoredInterfaceNames:   cloneStrings(m.opts.IgnoredInterfaceNames),
+		IgnoredInterfaceRegexps: cloneStrings(m.opts.IgnoredInterfaceRegexps),
+		BasePolicy:              apiAllowRules(m.opts.allowRules),
+		EffectivePolicy:         apiAllowRules(current),
+		ActiveRuleset:           activeName,
+		Rulesets:                apiRulesets(m.opts.Rulesets, activeName),
+		AdminAPI: adminapi.AdminConfig{
+			SocketPath: m.opts.AdminAPI.SocketPath,
+		},
+	}
+}
+
+func apiRulesets(rulesets []ruleset, activeName string) []adminapi.Ruleset {
+	if len(rulesets) == 0 {
+		return nil
+	}
+	out := make([]adminapi.Ruleset, 0, len(rulesets))
+	for _, ruleset := range rulesets {
+		out = append(out, adminapi.Ruleset{
+			Name:     ruleset.Name,
+			Active:   ruleset.Name == activeName,
+			Priority: ruleset.Priority,
+			MatchAll: ruleset.MatchAll,
+			Trigger: adminapi.RulesetTrigger{
+				InterfaceTypes:   cloneStrings(ruleset.Trigger.InterfaceTypes),
+				InterfaceNames:   cloneStrings(ruleset.Trigger.InterfaceNames),
+				InterfaceRegexps: cloneStrings(ruleset.Trigger.InterfaceRegexps),
+				IPAddrs:          apiAddrs(ruleset.Trigger.IPAddrs),
+			},
+			Policy: apiAllowRules(ruleset.allowRules),
+		})
+	}
+	return out
+}
+
+func apiAllowRules(rules allowRules) adminapi.AllowRules {
+	return adminapi.AllowRules{
+		AllowAll:       rules.AllowAll,
+		EnableV4:       rules.EnableV4,
+		EnableV6:       rules.EnableV6,
+		AllowedMarks:   apiAllowedMarks(rules.AllowedMarks),
+		AllowedPorts:   apiAllowedPorts(rules.AllowedPorts),
+		AllowedV4Hosts: apiAllowedV4Hosts(rules.AllowedV4Hosts),
+		AllowedV6Hosts: apiAllowedV6Hosts(rules.AllowedV6Hosts),
+		AllowedV4Pairs: apiAllowedV4Pairs(rules.AllowedV4Pairs),
+		AllowedV6Pairs: apiAllowedV6Pairs(rules.AllowedV6Pairs),
+	}
+}
+
+func apiAllowedMarks(values []uint32) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, fmt.Sprintf("0x%x", value))
+	}
+	return out
+}
+
+func apiAllowedPorts(values []portKey) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, fmt.Sprintf("%s/%d", apiProtocol(value.Protocol), ntohs(value.Dport)))
+	}
+	return out
+}
+
+func apiAllowedV4Hosts(values []uint32) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, ipv4FromNetworkOrder(value).String())
+	}
+	return out
+}
+
+func apiAllowedV6Hosts(values []ipv6AddrKey) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, netip.AddrFrom16(value.Addr).String())
+	}
+	return out
+}
+
+func apiAllowedV4Pairs(values []hostport4Key) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, fmt.Sprintf("%s/%s:%d", apiProtocol(value.Protocol), ipv4FromNetworkOrder(value.Daddr), ntohs(value.Dport)))
+	}
+	return out
+}
+
+func apiAllowedV6Pairs(values []hostport6Key) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		addrPort := netip.AddrPortFrom(netip.AddrFrom16(value.Daddr), ntohs(value.Dport))
+		out = append(out, fmt.Sprintf("%s/%s", apiProtocol(value.Protocol), addrPort))
+	}
+	return out
+}
+
+func apiProtocol(protocol uint8) string {
+	switch protocol {
+	case ipProtoTCP:
+		return "tcp"
+	case ipProtoUDP:
+		return "udp"
+	default:
+		return fmt.Sprintf("proto%d", protocol)
+	}
+}
+
+func apiAddrs(values []netip.Addr) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, value.String())
+	}
+	return out
+}
+
+func cloneStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	return append([]string(nil), values...)
 }
 
 func activeRuleset(all []interfaceInfo, rulesets []ruleset) *ruleset {
