@@ -55,15 +55,17 @@ type adminAPIAuthRules struct {
 }
 
 type adminAPIServer struct {
-	opts             adminAPIOptions
-	configSnapshot   func() adminapi.CurrentConfig
-	mutateConfig     func(adminapi.MutationRequest) adminapi.MutationResult
-	mutateTmpRuleset func(string, adminapi.MutationRequest) adminapi.MutationResult
-	removeTmpRuleset func(string) adminapi.MutationResult
-	nextConnectionID atomic.Uint64
-	mu               sync.Mutex
-	clients          map[uint64]*adminAPIClient
-	notifications    []adminapi.Notification
+	opts                adminAPIOptions
+	configSnapshot      func() adminapi.CurrentConfig
+	mutateConfig        func(adminapi.MutationRequest) adminapi.MutationResult
+	mutateTmpRuleset    func(string, adminapi.MutationRequest) adminapi.MutationResult
+	removeTmpRuleset    func(string) adminapi.MutationResult
+	mutateForceRuleset  func(string, adminapi.MutationRequest) adminapi.MutationResult
+	removeForceRulesets func(string) adminapi.MutationResult
+	nextConnectionID    atomic.Uint64
+	mu                  sync.Mutex
+	clients             map[uint64]*adminAPIClient
+	notifications       []adminapi.Notification
 }
 
 type adminAPIPeer struct {
@@ -136,6 +138,11 @@ func newAdminAPIServer(opts adminAPIOptions, configSnapshot func() adminapi.Curr
 func (s *adminAPIServer) setTemporaryRulesetCallbacks(mutate func(string, adminapi.MutationRequest) adminapi.MutationResult, remove func(string) adminapi.MutationResult) {
 	s.mutateTmpRuleset = mutate
 	s.removeTmpRuleset = remove
+}
+
+func (s *adminAPIServer) setForceRulesetCallbacks(mutate func(string, adminapi.MutationRequest) adminapi.MutationResult, remove func(string) adminapi.MutationResult) {
+	s.mutateForceRuleset = mutate
+	s.removeForceRulesets = remove
 }
 
 func (s *adminAPIServer) listenAndServe(ctx context.Context) error {
@@ -276,15 +283,23 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 	defer func() {
 		s.removeClient(client.id)
 		s.notify(adminapi.EventTypeClients)
-		if s.removeTmpRuleset == nil {
-			return
+		if s.removeForceRulesets != nil {
+			result := s.removeForceRulesets(client.owner)
+			if !result.OK {
+				log.Printf("Admin API failed to remove force-active rulesets for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, result.Error)
+			} else if result.Changed {
+				log.Printf("Admin API removed force-active rulesets for pid=%d uid=%d gid=%d", peer.PID, peer.UID, peer.GID)
+				s.notify(adminapi.EventTypeConfig)
+			}
 		}
-		result := s.removeTmpRuleset(client.owner)
-		if !result.OK {
-			log.Printf("Admin API failed to remove temporary ruleset for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, result.Error)
-		} else if result.Changed {
-			log.Printf("Admin API removed temporary ruleset for pid=%d uid=%d gid=%d", peer.PID, peer.UID, peer.GID)
-			s.notify(adminapi.EventTypeConfig)
+		if s.removeTmpRuleset != nil {
+			result := s.removeTmpRuleset(client.owner)
+			if !result.OK {
+				log.Printf("Admin API failed to remove temporary ruleset for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, result.Error)
+			} else if result.Changed {
+				log.Printf("Admin API removed temporary ruleset for pid=%d uid=%d gid=%d", peer.PID, peer.UID, peer.GID)
+				s.notify(adminapi.EventTypeConfig)
+			}
 		}
 	}()
 
@@ -540,6 +555,12 @@ func (s *adminAPIServer) handleMutation(owner string, req adminapi.MutationReque
 			return adminapi.MutationResult{OK: false, Error: "temporary rulesets are not available", Config: s.configSnapshot()}
 		}
 		return s.mutateTmpRuleset(owner, req)
+	}
+	if req.Target == "force_ruleset" {
+		if s.mutateForceRuleset == nil {
+			return adminapi.MutationResult{OK: false, Error: "force-active rulesets are not available", Config: s.configSnapshot()}
+		}
+		return s.mutateForceRuleset(owner, req)
 	}
 	return s.mutateConfig(req)
 }

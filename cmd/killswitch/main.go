@@ -207,13 +207,14 @@ type egressManager struct {
 }
 
 type policyManager struct {
-	mu          sync.Mutex
-	objs        *killswitchObjects
-	opts        options
-	tmpRulesets map[string]allowRules
-	current     allowRules
-	activeName  string
-	set         bool
+	mu            sync.Mutex
+	objs          *killswitchObjects
+	opts          options
+	tmpRulesets   map[string]allowRules
+	forceRulesets map[string]map[string]int
+	current       allowRules
+	activeName    string
+	set           bool
 }
 
 func main() {
@@ -477,6 +478,33 @@ func applyTemporaryRulesetMutation(owner string, req adminapi.MutationRequest, p
 	return adminapi.MutationResult{OK: true, Changed: changed, Config: policies.configSnapshot()}
 }
 
+func applyForceRulesetMutation(owner string, req adminapi.MutationRequest, policies *policyManager, _ *egressManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
+	reconcileMu.Lock()
+	defer reconcileMu.Unlock()
+
+	if req.Ruleset == "" {
+		return adminapi.MutationResult{OK: false, Error: "ruleset name is required", Config: policies.configSnapshot()}
+	}
+	stateChanged := false
+	switch req.Operation {
+	case adminapi.MutationAdd, adminapi.MutationSet:
+		if !policies.forceActivateRuleset(owner, req.Ruleset) {
+			return adminapi.MutationResult{OK: false, Error: fmt.Sprintf("ruleset %q does not exist", req.Ruleset), Config: policies.configSnapshot()}
+		}
+		stateChanged = true
+	case adminapi.MutationRemove:
+		stateChanged = policies.releaseForceRuleset(owner, req.Ruleset)
+	default:
+		return adminapi.MutationResult{OK: false, Error: fmt.Sprintf("unsupported mutation operation %q", req.Operation), Config: policies.configSnapshot()}
+	}
+
+	policyChanged, err := policies.reconcileCurrent(true)
+	if err != nil {
+		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
+	}
+	return adminapi.MutationResult{OK: true, Changed: stateChanged || policyChanged, Config: policies.configSnapshot()}
+}
+
 func removeTemporaryRuleset(owner string, policies *policyManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
 	reconcileMu.Lock()
 	defer reconcileMu.Unlock()
@@ -489,6 +517,21 @@ func removeTemporaryRuleset(owner string, policies *policyManager, reconcileMu *
 		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
 	}
 	return adminapi.MutationResult{OK: true, Changed: changed, Config: policies.configSnapshot()}
+}
+
+func removeForceRulesets(owner string, policies *policyManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
+	reconcileMu.Lock()
+	defer reconcileMu.Unlock()
+
+	stateChanged := policies.removeForceRulesets(owner)
+	if !stateChanged {
+		return adminapi.MutationResult{OK: true, Changed: false, Config: policies.configSnapshot()}
+	}
+	policyChanged, err := policies.reconcileCurrent(true)
+	if err != nil {
+		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
+	}
+	return adminapi.MutationResult{OK: true, Changed: stateChanged || policyChanged, Config: policies.configSnapshot()}
 }
 
 func mutateOptions(opts options, req adminapi.MutationRequest) (options, error) {
@@ -968,6 +1011,33 @@ func cloneTemporaryRulesets(rulesets map[string]allowRules) []temporaryRuleset {
 	return out
 }
 
+func cloneForceRulesets(rulesets map[string]map[string]int) []forceRuleset {
+	if len(rulesets) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(rulesets))
+	for name := range rulesets {
+		if len(rulesets[name]) > 0 {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+
+	out := make([]forceRuleset, 0, len(names))
+	for _, name := range names {
+		owners := make([]string, 0, len(rulesets[name]))
+		for owner := range rulesets[name] {
+			owners = append(owners, owner)
+		}
+		sort.Strings(owners)
+		out = append(out, forceRuleset{
+			Name:   name,
+			Owners: owners,
+		})
+	}
+	return out
+}
+
 func run(parent context.Context, opts options) error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("remove memlock rlimit: %w", err)
@@ -1030,6 +1100,14 @@ func run(parent context.Context, opts options) error {
 		},
 		func(owner string) adminapi.MutationResult {
 			return removeTemporaryRuleset(owner, policies, &reconcileMu)
+		},
+	)
+	adminServer.setForceRulesetCallbacks(
+		func(owner string, req adminapi.MutationRequest) adminapi.MutationResult {
+			return applyForceRulesetMutation(owner, req, policies, manager, &reconcileMu)
+		},
+		func(owner string) adminapi.MutationResult {
+			return removeForceRulesets(owner, policies, &reconcileMu)
 		},
 	)
 	go func() {
@@ -1155,12 +1233,19 @@ func (m *policyManager) replaceOptions(opts options) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.opts = cloneOptions(opts)
+	m.pruneForceRulesetsLocked()
 }
 
 func (m *policyManager) temporaryRulesetsSnapshot() []temporaryRuleset {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return cloneTemporaryRulesets(m.tmpRulesets)
+}
+
+func (m *policyManager) forceRulesetsSnapshot() []forceRuleset {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return cloneForceRulesets(m.forceRulesets)
 }
 
 func (m *policyManager) setTemporaryRuleset(owner string, rules allowRules) {
@@ -1182,6 +1267,81 @@ func (m *policyManager) removeTemporaryRuleset(owner string) bool {
 	return true
 }
 
+func (m *policyManager) forceActivateRuleset(owner, name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if findRuleset(m.opts.Rulesets, name) < 0 {
+		return false
+	}
+	if m.forceRulesets == nil {
+		m.forceRulesets = make(map[string]map[string]int)
+	}
+	owners := m.forceRulesets[name]
+	if owners == nil {
+		owners = make(map[string]int)
+		m.forceRulesets[name] = owners
+	}
+	owners[owner]++
+	return true
+}
+
+func (m *policyManager) releaseForceRuleset(owner, name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.releaseForceRulesetLocked(owner, name)
+}
+
+func (m *policyManager) removeForceRulesets(owner string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	changed := false
+	for name := range m.forceRulesets {
+		if m.releaseAllForceRulesetLocked(owner, name) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+func (m *policyManager) releaseForceRulesetLocked(owner, name string) bool {
+	owners := m.forceRulesets[name]
+	if owners == nil || owners[owner] == 0 {
+		return false
+	}
+	if owners[owner] == 1 {
+		delete(owners, owner)
+	} else {
+		owners[owner]--
+	}
+	if len(owners) == 0 {
+		delete(m.forceRulesets, name)
+	}
+	return true
+}
+
+func (m *policyManager) releaseAllForceRulesetLocked(owner, name string) bool {
+	owners := m.forceRulesets[name]
+	if owners == nil || owners[owner] == 0 {
+		return false
+	}
+	delete(owners, owner)
+	if len(owners) == 0 {
+		delete(m.forceRulesets, name)
+	}
+	return true
+}
+
+func (m *policyManager) pruneForceRulesetsLocked() {
+	if len(m.forceRulesets) == 0 {
+		return
+	}
+	for name := range m.forceRulesets {
+		if findRuleset(m.opts.Rulesets, name) < 0 {
+			delete(m.forceRulesets, name)
+		}
+	}
+}
+
 func (m *policyManager) reconcileCurrent(logChange bool) (bool, error) {
 	all, err := listInterfaces()
 	if err != nil {
@@ -1193,8 +1353,9 @@ func (m *policyManager) reconcileCurrent(logChange bool) (bool, error) {
 func (m *policyManager) reconcile(all []interfaceInfo, logChange bool) (bool, error) {
 	opts := m.optionsSnapshot()
 	tmpRulesets := m.temporaryRulesetsSnapshot()
+	forceRulesets := m.forceRulesetsSnapshot()
 	active := activeRuleset(all, opts.Rulesets)
-	effective := effectiveAllowRules(opts.allowRules, active, tmpRulesets)
+	effective := effectiveAllowRules(opts.allowRules, active, forcedRulesets(opts.Rulesets, forceRulesets), tmpRulesets)
 	activeName := ""
 	if active != nil {
 		activeName = active.Name
@@ -1226,6 +1387,7 @@ func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 	set := m.set
 	opts := cloneOptions(m.opts)
 	tmpRulesets := cloneTemporaryRulesets(m.tmpRulesets)
+	forceRulesets := cloneForceRulesets(m.forceRulesets)
 	m.mu.Unlock()
 
 	if !set {
@@ -1242,6 +1404,7 @@ func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 		EffectivePolicy:         apiAllowRules(current),
 		ActiveRuleset:           activeName,
 		Rulesets:                apiRulesets(opts.Rulesets, activeName),
+		ForceActiveRulesets:     apiForceRulesets(forceRulesets),
 		TemporaryRulesets:       apiTemporaryRulesets(tmpRulesets),
 		AdminAPI: adminapi.AdminConfig{
 			SocketPath: opts.AdminAPI.SocketPath,
@@ -1273,15 +1436,37 @@ type temporaryRuleset struct {
 	Rules allowRules
 }
 
-func effectiveAllowRules(base allowRules, active *ruleset, tmpRulesets []temporaryRuleset) allowRules {
+type forceRuleset struct {
+	Name   string
+	Owners []string
+}
+
+func effectiveAllowRules(base allowRules, active *ruleset, forceRulesets []ruleset, tmpRulesets []temporaryRuleset) allowRules {
 	effective := base
 	if active != nil {
 		effective = mergeAllowRules(effective, active.allowRules)
+	}
+	for _, ruleset := range forceRulesets {
+		effective = mergeAllowRules(effective, ruleset.allowRules)
 	}
 	for _, tmp := range tmpRulesets {
 		effective = mergeAllowRules(effective, tmp.Rules)
 	}
 	return canonicalAllowRules(effective)
+}
+
+func forcedRulesets(rulesets []ruleset, forceRulesets []forceRuleset) []ruleset {
+	if len(forceRulesets) == 0 {
+		return nil
+	}
+	out := make([]ruleset, 0, len(forceRulesets))
+	for _, forced := range forceRulesets {
+		idx := findRuleset(rulesets, forced.Name)
+		if idx >= 0 {
+			out = append(out, rulesets[idx])
+		}
+	}
+	return out
 }
 
 func apiRulesets(rulesets []ruleset, activeName string) []adminapi.Ruleset {
@@ -1317,6 +1502,20 @@ func apiTemporaryRulesets(rulesets []temporaryRuleset) []adminapi.TmpRuleset {
 		out = append(out, adminapi.TmpRuleset{
 			Client: ruleset.Owner,
 			Policy: apiAllowRules(ruleset.Rules),
+		})
+	}
+	return out
+}
+
+func apiForceRulesets(rulesets []forceRuleset) []adminapi.ForceRuleset {
+	if len(rulesets) == 0 {
+		return nil
+	}
+	out := make([]adminapi.ForceRuleset, 0, len(rulesets))
+	for _, ruleset := range rulesets {
+		out = append(out, adminapi.ForceRuleset{
+			Name:    ruleset.Name,
+			Clients: cloneStrings(ruleset.Owners),
 		})
 	}
 	return out

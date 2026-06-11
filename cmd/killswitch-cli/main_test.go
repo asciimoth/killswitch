@@ -32,6 +32,12 @@ func TestPrintConfigIncludesTemporaryRulesets(t *testing.T) {
 				},
 			},
 		},
+		ForceActiveRulesets: []adminapi.ForceRuleset{
+			{
+				Name:    "office",
+				Clients: []string{"pid=100 uid=1000 gid=1000 conn=1", "pid=101 uid=1000 gid=1000 conn=2"},
+			},
+		},
 		Rulesets: []adminapi.Ruleset{
 			{
 				Name:     "office",
@@ -63,6 +69,8 @@ func TestPrintConfigIncludesTemporaryRulesets(t *testing.T) {
 		"client=pid=100 uid=1000 gid=1000 conn=1",
 		"allowed v6 hosts:",
 		"2001:db8::10",
+		"Force-active rulesets",
+		"clients=pid=100 uid=1000 gid=1000 conn=1, pid=101 uid=1000 gid=1000 conn=2",
 		"Rulesets",
 		"office:",
 		"disabled=true",

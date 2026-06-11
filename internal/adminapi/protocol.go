@@ -145,20 +145,21 @@ func (m UnknownMessage) messageType() MessageType {
 }
 
 type CurrentConfig struct {
-	InterfaceTypes          []string     `json:"interface_types,omitempty"`
-	InterfaceNames          []string     `json:"interface_names,omitempty"`
-	InterfaceRegexps        []string     `json:"interface_regexps,omitempty"`
-	IgnoredInterfaceTypes   []string     `json:"ignored_interface_types,omitempty"`
-	IgnoredInterfaceNames   []string     `json:"ignored_interface_names,omitempty"`
-	IgnoredInterfaceRegexps []string     `json:"ignored_interface_regexps,omitempty"`
-	Interfaces              []Interface  `json:"interfaces,omitempty"`
-	BasePolicy              AllowRules   `json:"base_policy"`
-	EffectivePolicy         AllowRules   `json:"effective_policy"`
-	ActiveRuleset           string       `json:"active_ruleset,omitempty"`
-	Rulesets                []Ruleset    `json:"rulesets,omitempty"`
-	TemporaryRulesets       []TmpRuleset `json:"tmp_rulesets,omitempty"`
-	Clients                 []ClientInfo `json:"clients,omitempty"`
-	AdminAPI                AdminConfig  `json:"admin_api"`
+	InterfaceTypes          []string       `json:"interface_types,omitempty"`
+	InterfaceNames          []string       `json:"interface_names,omitempty"`
+	InterfaceRegexps        []string       `json:"interface_regexps,omitempty"`
+	IgnoredInterfaceTypes   []string       `json:"ignored_interface_types,omitempty"`
+	IgnoredInterfaceNames   []string       `json:"ignored_interface_names,omitempty"`
+	IgnoredInterfaceRegexps []string       `json:"ignored_interface_regexps,omitempty"`
+	Interfaces              []Interface    `json:"interfaces,omitempty"`
+	BasePolicy              AllowRules     `json:"base_policy"`
+	EffectivePolicy         AllowRules     `json:"effective_policy"`
+	ActiveRuleset           string         `json:"active_ruleset,omitempty"`
+	Rulesets                []Ruleset      `json:"rulesets,omitempty"`
+	ForceActiveRulesets     []ForceRuleset `json:"force_active_rulesets,omitempty"`
+	TemporaryRulesets       []TmpRuleset   `json:"tmp_rulesets,omitempty"`
+	Clients                 []ClientInfo   `json:"clients,omitempty"`
+	AdminAPI                AdminConfig    `json:"admin_api"`
 }
 
 type Interface struct {
@@ -209,6 +210,11 @@ type Ruleset struct {
 type TmpRuleset struct {
 	Client string     `json:"client"`
 	Policy AllowRules `json:"policy"`
+}
+
+type ForceRuleset struct {
+	Name    string   `json:"name"`
+	Clients []string `json:"clients,omitempty"`
 }
 
 type RulesetMutation struct {

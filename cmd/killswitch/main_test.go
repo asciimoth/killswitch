@@ -534,6 +534,7 @@ func TestEffectiveAllowRulesMergesTemporaryRulesets(t *testing.T) {
 	effective := effectiveAllowRules(
 		allowRules{EnableV4: true, AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}},
 		active,
+		nil,
 		[]temporaryRuleset{
 			{Owner: "client-b", Rules: allowRules{EnableV6: true, AllowedV6Hosts: []ipv6AddrKey{ipv6Key(netipMustParse("2001:db8::10"))}}},
 			{Owner: "client-a", Rules: allowRules{AllowedV4Hosts: []uint32{ipv4Key(netipMustParse("192.0.2.10"))}}},
@@ -548,6 +549,74 @@ func TestEffectiveAllowRulesMergesTemporaryRulesets(t *testing.T) {
 	}
 	if len(effective.AllowedPorts) != 1 || len(effective.AllowedV4Hosts) != 1 || len(effective.AllowedV6Hosts) != 1 {
 		t.Fatalf("allowlists were not merged: %+v", effective)
+	}
+}
+
+func TestEffectiveAllowRulesMergesForceActiveRulesets(t *testing.T) {
+	effective := effectiveAllowRules(
+		allowRules{EnableV4: true},
+		&ruleset{Name: "active", allowRules: allowRules{AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}}},
+		[]ruleset{
+			{
+				Name:       "disabled",
+				Disabled:   true,
+				allowRules: allowRules{EnableV6: true, AllowedV6Hosts: []ipv6AddrKey{ipv6Key(netipMustParse("2001:db8::10"))}},
+			},
+			{
+				Name:       "inactive",
+				allowRules: allowRules{AllowedV4Hosts: []uint32{ipv4Key(netipMustParse("192.0.2.10"))}},
+			},
+		},
+		nil,
+	)
+
+	if !effective.EnableV4 || !effective.EnableV6 {
+		t.Fatalf("unexpected effective gates: %+v", effective)
+	}
+	if len(effective.AllowedPorts) != 1 || len(effective.AllowedV4Hosts) != 1 || len(effective.AllowedV6Hosts) != 1 {
+		t.Fatalf("force-active rulesets were not merged: %+v", effective)
+	}
+}
+
+func TestPolicyManagerForceRulesetReferenceCounting(t *testing.T) {
+	manager := &policyManager{
+		opts: options{
+			Rulesets: []ruleset{
+				{Name: "office", Disabled: true, allowRules: allowRules{EnableV6: true}},
+			},
+		},
+		current: allowRules{},
+		set:     true,
+	}
+
+	if !manager.forceActivateRuleset("client-a", "office") {
+		t.Fatal("expected force activation to be accepted")
+	}
+	if !manager.forceActivateRuleset("client-b", "office") {
+		t.Fatal("expected second force activation to be accepted")
+	}
+	forced := manager.forceRulesetsSnapshot()
+	if len(forced) != 1 || len(forced[0].Owners) != 2 {
+		t.Fatalf("force-active rulesets = %+v", forced)
+	}
+	effective := effectiveAllowRules(allowRules{}, nil, forcedRulesets(manager.optionsSnapshot().Rulesets, forced), nil)
+	if !effective.EnableV6 {
+		t.Fatalf("expected force-active ruleset to affect policy: %+v", effective)
+	}
+
+	if !manager.removeForceRulesets("client-a") {
+		t.Fatal("expected client-a force activation to be removed")
+	}
+	forced = manager.forceRulesetsSnapshot()
+	if len(forced) != 1 || len(forced[0].Owners) != 1 || forced[0].Owners[0] != "client-b" {
+		t.Fatalf("expected client-b reference to keep ruleset active: %+v", forced)
+	}
+
+	if !manager.removeForceRulesets("client-b") {
+		t.Fatal("expected client-b force activation to be removed")
+	}
+	if forced := manager.forceRulesetsSnapshot(); len(forced) != 0 {
+		t.Fatalf("expected forced ruleset to be released: %+v", forced)
 	}
 }
 
@@ -574,6 +643,32 @@ func TestPolicyManagerConfigSnapshotIncludesTemporaryRulesets(t *testing.T) {
 	}
 	if len(cfg.TemporaryRulesets[0].Policy.AllowedPorts) != 1 || !cfg.TemporaryRulesets[1].Policy.EnableV6 {
 		t.Fatalf("tmp ruleset policies = %+v", cfg.TemporaryRulesets)
+	}
+}
+
+func TestPolicyManagerConfigSnapshotIncludesForceActiveRulesets(t *testing.T) {
+	manager := &policyManager{
+		opts: options{
+			Rulesets: []ruleset{
+				{Name: "office", allowRules: allowRules{EnableV6: true}},
+			},
+		},
+		forceRulesets: map[string]map[string]int{
+			"office": {
+				"client-b": 1,
+				"client-a": 2,
+			},
+		},
+		set: true,
+	}
+
+	cfg := manager.configSnapshot()
+	if len(cfg.ForceActiveRulesets) != 1 {
+		t.Fatalf("force-active rulesets = %+v", cfg.ForceActiveRulesets)
+	}
+	forced := cfg.ForceActiveRulesets[0]
+	if forced.Name != "office" || len(forced.Clients) != 2 || forced.Clients[0] != "client-a" || forced.Clients[1] != "client-b" {
+		t.Fatalf("force-active ruleset snapshot = %+v", forced)
 	}
 }
 

@@ -45,6 +45,8 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 		return runMutation(adminapi.MutationSet, args[1:], stdout, stderr)
 	case "tmp-ruleset":
 		return runTemporaryRuleset(args[1:], os.Stdin, stdout, stderr)
+	case "force-ruleset":
+		return runForceRuleset(args[1:], os.Stdin, stdout, stderr)
 	case "notifications":
 		return runNotifications(args[1:], stdout, stderr)
 	case "debug-notify":
@@ -194,6 +196,81 @@ func runTemporaryRuleset(args []string, stdin io.Reader, stdout, stderr io.Write
 		return errors.New(result.Error)
 	}
 	if _, err := fmt.Fprintln(stdout, "temporary ruleset installed; press Ctrl+C, Ctrl+D, or Esc to remove it"); err != nil {
+		return err
+	}
+	restoreInput, err := rawInputMode(stdin)
+	if err != nil {
+		return err
+	}
+	defer restoreInput()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		for {
+			if _, err := client.Receive(); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+	}()
+
+	inputDone := make(chan error, 1)
+	go func() {
+		inputDone <- waitForStopInput(stdin)
+	}()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	select {
+	case err := <-serverDone:
+		if adminapi.IsEOF(err) {
+			return errors.New("server disconnected")
+		}
+		return fmt.Errorf("server disconnected: %w", err)
+	case err := <-inputDone:
+		return err
+	case <-signals:
+		return nil
+	}
+}
+
+func runForceRuleset(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("force-ruleset", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	ruleset := flags.String("ruleset", "", "ruleset name to force activate")
+	flags.StringVar(ruleset, "r", "", "ruleset name to force activate")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("force-ruleset expects no positional arguments, got: %s", strings.Join(flags.Args(), " "))
+	}
+	if *ruleset == "" {
+		return errors.New("force-ruleset requires -ruleset NAME")
+	}
+
+	client, err := adminapi.DialUnix(context.Background(), *socketPath)
+	if err != nil {
+		return err
+	}
+	defer client.Close() //nolint:errcheck
+
+	result, err := client.Mutate(adminapi.MutationRequest{
+		Operation: adminapi.MutationSet,
+		Target:    "force_ruleset",
+		Ruleset:   *ruleset,
+	})
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return errors.New(result.Error)
+	}
+	if _, err := fmt.Fprintf(stdout, "ruleset %q force activated; press Ctrl+C, Ctrl+D, or Esc to release it\n", *ruleset); err != nil {
 		return err
 	}
 	restoreInput, err := rawInputMode(stdin)
@@ -454,7 +531,7 @@ func printUsage(w io.Writer) error {
 	if _, err := fmt.Fprintln(w, "Usage:"); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch]\n  killswitch-cli notifications [-socket PATH]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -json JSON|-json @FILE")
+	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch]\n  killswitch-cli notifications [-socket PATH]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -json JSON|-json @FILE\n  killswitch-cli force-ruleset [-socket PATH] -ruleset NAME")
 	return err
 }
 
@@ -524,6 +601,14 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 		for i, ruleset := range cfg.TemporaryRulesets {
 			printer.printf("  #%d:\tclient=%s\n", i+1, ruleset.Client)
 			printer.printAllowRulesWithPrefix("    ", ruleset.Policy)
+		}
+	}
+
+	if len(cfg.ForceActiveRulesets) > 0 {
+		printer.println()
+		printer.println("Force-active rulesets")
+		for _, ruleset := range cfg.ForceActiveRulesets {
+			printer.printf("  %s:\tclients=%s\n", ruleset.Name, strings.Join(ruleset.Clients, ", "))
 		}
 	}
 
