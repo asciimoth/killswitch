@@ -31,13 +31,24 @@
   "rulesets": {
     "wireguard-up": {
       "disabled": false,
-      "match": "and",
+      "match": "or",
       "trigger": {
         "interface_names": [
           "wg0"
         ],
         "ip_addrs": [
           "10.64.0.2"
+        ],
+        "ssids": [
+          "Office WiFi"
+        ],
+        "bssids": [
+          "aa:bb:cc:dd:ee:ff"
+        ],
+        "gateway_macs": [
+          "00:11:22:33:44:55",
+          "f4:0b:9f:77:2a:c0",
+          "34:60:f9:c0:55:98"
         ]
       },
       "enable_v4": true,

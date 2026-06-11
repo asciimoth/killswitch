@@ -11,8 +11,6 @@ import (
 	"testing"
 
 	"github.com/asciimoth/killswitch/internal/adminapi"
-	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
 
 func TestConfigRequiresInterfaceSelector(t *testing.T) {
@@ -112,7 +110,7 @@ func TestConfigToOptionsParsesRulesets(t *testing.T) {
 			"office": {
 				Disabled:       true,
 				Match:          "and",
-				Trigger:        triggerConfig{InterfaceNames: []string{"wg0"}, IPAddrs: []string{"10.64.0.2"}},
+				Trigger:        triggerConfig{InterfaceNames: []string{"wg0"}, IPAddrs: []string{"10.64.0.2"}, SSIDs: []string{"Office WiFi"}, BSSIDs: []string{"AA:BB:CC:DD:EE:FF"}, GatewayMACs: []string{"00:11:22:33:44:55"}},
 				EnableV6:       true,
 				AllowedV4Hosts: []string{"192.0.2.10"},
 			},
@@ -135,6 +133,15 @@ func TestConfigToOptionsParsesRulesets(t *testing.T) {
 	if len(ruleset.Trigger.IPAddrs) != 1 || ruleset.Trigger.IPAddrs[0] != netipMustParse("10.64.0.2") {
 		t.Fatalf("unexpected ip trigger: %+v", ruleset.Trigger.IPAddrs)
 	}
+	if got := strings.Join(ruleset.Trigger.SSIDs, ","); got != "Office WiFi" {
+		t.Fatalf("unexpected ssid trigger: %+v", ruleset.Trigger.SSIDs)
+	}
+	if got := strings.Join(ruleset.Trigger.BSSIDs, ","); got != "aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("unexpected bssid trigger: %+v", ruleset.Trigger.BSSIDs)
+	}
+	if got := strings.Join(ruleset.Trigger.GatewayMACs, ","); got != "00:11:22:33:44:55" {
+		t.Fatalf("unexpected gateway mac trigger: %+v", ruleset.Trigger.GatewayMACs)
+	}
 	if !ruleset.EnableV6 || len(ruleset.AllowedV4Hosts) != 1 {
 		t.Fatalf("unexpected ruleset rules: %+v", ruleset.allowRules)
 	}
@@ -147,12 +154,24 @@ func TestConfigToOptionsRejectsInvalidRulesets(t *testing.T) {
 		{InterfaceNames: []string{"eth0"}, Rulesets: map[string]rulesetConfig{"vpn": {}}},
 		{InterfaceNames: []string{"eth0"}, Rulesets: map[string]rulesetConfig{"vpn": {Trigger: triggerConfig{InterfaceRegexps: []string{"["}}}}},
 		{InterfaceNames: []string{"eth0"}, Rulesets: map[string]rulesetConfig{"vpn": {Trigger: triggerConfig{IPAddrs: []string{"not-an-ip"}}}}},
+		{InterfaceNames: []string{"eth0"}, Rulesets: map[string]rulesetConfig{"vpn": {Trigger: triggerConfig{BSSIDs: []string{"not-a-mac"}}}}},
+		{InterfaceNames: []string{"eth0"}, Rulesets: map[string]rulesetConfig{"vpn": {Trigger: triggerConfig{GatewayMACs: []string{"not-a-mac"}}}}},
 	}
 
 	for _, cfg := range tests {
 		if _, err := configToOptions(cfg); err == nil {
 			t.Fatalf("configToOptions(%+v) succeeded, expected error", cfg)
 		}
+	}
+}
+
+func TestParseIWLinkInfo(t *testing.T) {
+	ssid, bssid := parseIWLinkInfo(`Connected to AA:BB:CC:DD:EE:FF (on wlan0)
+	SSID: Office WiFi
+	freq: 2412
+`)
+	if ssid != "Office WiFi" || bssid != "aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("ssid=%q bssid=%q", ssid, bssid)
 	}
 }
 
@@ -366,6 +385,32 @@ func TestRulesetTriggerANDRequiresAllTriggers(t *testing.T) {
 	}
 	if !rulesetTriggerMatchesInterface(all[0], trigger, false) {
 		t.Fatal("expected OR trigger to match when one predicate is present")
+	}
+}
+
+func TestRulesetTriggerMatchesWifiAndGatewayFields(t *testing.T) {
+	iface := interfaceInfo{
+		Name:        "wlan0",
+		Index:       4,
+		Type:        "device",
+		SSID:        "Office WiFi",
+		BSSID:       "aa:bb:cc:dd:ee:ff",
+		GatewayMACs: []string{"00:11:22:33:44:55"},
+	}
+	trigger := rulesetTrigger{
+		SSIDs:       []string{"Office WiFi"},
+		BSSIDs:      []string{"aa:bb:cc:dd:ee:ff"},
+		GatewayMACs: []string{"00:11:22:33:44:55"},
+	}
+	if !rulesetTriggerMatchesInterface(iface, trigger, true) {
+		t.Fatal("expected AND trigger to match wifi and gateway fields")
+	}
+	trigger.GatewayMACs = []string{"00:11:22:33:44:66"}
+	if rulesetTriggerMatchesInterface(iface, trigger, true) {
+		t.Fatal("expected AND trigger to miss when gateway MAC differs")
+	}
+	if !rulesetTriggerMatchesInterface(iface, trigger, false) {
+		t.Fatal("expected OR trigger to match when wifi fields match")
 	}
 }
 
@@ -942,6 +987,9 @@ func TestMutateOptionsSetsWholeRuleset(t *testing.T) {
 			Trigger: adminapi.RulesetTrigger{
 				InterfaceNames: []string{"wg0"},
 				IPAddrs:        []string{"10.64.0.2"},
+				SSIDs:          []string{"Office WiFi"},
+				BSSIDs:         []string{"AA:BB:CC:DD:EE:FF"},
+				GatewayMACs:    []string{"00:11:22:33:44:55"},
 			},
 			Policy: adminapi.AllowRules{EnableV6: true},
 		},
@@ -958,6 +1006,48 @@ func TestMutateOptionsSetsWholeRuleset(t *testing.T) {
 	}
 	if len(ruleset.Trigger.IPAddrs) != 1 || ruleset.Trigger.IPAddrs[0] != netipMustParse("10.64.0.2") {
 		t.Fatalf("trigger = %+v", ruleset.Trigger)
+	}
+	if got := strings.Join(ruleset.Trigger.SSIDs, ","); got != "Office WiFi" {
+		t.Fatalf("ssid trigger = %+v", ruleset.Trigger)
+	}
+	if got := strings.Join(ruleset.Trigger.BSSIDs, ","); got != "aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("bssid trigger = %+v", ruleset.Trigger)
+	}
+	if got := strings.Join(ruleset.Trigger.GatewayMACs, ","); got != "00:11:22:33:44:55" {
+		t.Fatalf("gateway mac trigger = %+v", ruleset.Trigger)
+	}
+}
+
+func TestMutateOptionsMutatesNewRulesetTriggerFields(t *testing.T) {
+	next, err := mutateOptions(options{
+		InterfaceNames: []string{"eth0"},
+		Rulesets: []ruleset{
+			{Name: "office", Trigger: rulesetTrigger{InterfaceNames: []string{"wlan0"}}},
+		},
+	}, adminapi.MutationRequest{
+		Operation: adminapi.MutationSet,
+		Target:    "ruleset.trigger.bssids",
+		Ruleset:   "office",
+		Value:     json.RawMessage(`["AA:BB:CC:DD:EE:FF"]`),
+	})
+	if err != nil {
+		t.Fatalf("mutate bssids: %v", err)
+	}
+	if got := strings.Join(next.Rulesets[0].Trigger.BSSIDs, ","); got != "aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("bssid trigger = %+v", next.Rulesets[0].Trigger)
+	}
+
+	next, err = mutateOptions(next, adminapi.MutationRequest{
+		Operation: adminapi.MutationSet,
+		Target:    "ruleset.trigger.gateway_macs",
+		Ruleset:   "office",
+		Value:     json.RawMessage(`"00:11:22:33:44:55"`),
+	})
+	if err != nil {
+		t.Fatalf("mutate gateway macs: %v", err)
+	}
+	if got := strings.Join(next.Rulesets[0].Trigger.GatewayMACs, ","); got != "00:11:22:33:44:55" {
+		t.Fatalf("gateway mac trigger = %+v", next.Rulesets[0].Trigger)
 	}
 }
 
@@ -1012,55 +1102,6 @@ func TestMutateOptionsSetsRulesetDisabled(t *testing.T) {
 	}
 	if len(next.Rulesets) != 1 || !next.Rulesets[0].Disabled {
 		t.Fatalf("rulesets = %+v", next.Rulesets)
-	}
-}
-
-func TestShouldReconcileLinkUpdateIgnoresUnchangedSelectedInterface(t *testing.T) {
-	manager := newEgressManager(nil)
-	manager.attached[4] = attachedInterface{info: interfaceInfo{Name: "wlp0s20f3", Index: 4, Type: "device"}}
-
-	if manager.shouldReconcileLinkUpdate(linkUpdate(unix.RTM_NEWLINK, 4, "wlp0s20f3", "device"), options{
-		InterfaceRegexps: []string{"^wl"},
-	}) {
-		t.Fatal("expected unchanged selected interface update to be ignored")
-	}
-}
-
-func TestShouldReconcileLinkUpdateAllowsAttachAndDetachEvents(t *testing.T) {
-	manager := newEgressManager(nil)
-
-	if !manager.shouldReconcileLinkUpdate(linkUpdate(unix.RTM_NEWLINK, 4, "wlp0s20f3", "device"), options{
-		InterfaceRegexps: []string{"^wl"},
-	}) {
-		t.Fatal("expected new matching interface to trigger reconcile")
-	}
-
-	manager.attached[4] = attachedInterface{info: interfaceInfo{Name: "wlp0s20f3", Index: 4, Type: "device"}}
-	if !manager.shouldReconcileLinkUpdate(linkUpdate(unix.RTM_DELLINK, 4, "wlp0s20f3", "device"), options{
-		InterfaceRegexps: []string{"^wl"},
-	}) {
-		t.Fatal("expected deleted attached interface to trigger reconcile")
-	}
-}
-
-func TestShouldReconcileLinkUpdateIgnoresIgnoredInterface(t *testing.T) {
-	manager := newEgressManager(nil)
-
-	if manager.shouldReconcileLinkUpdate(linkUpdate(unix.RTM_NEWLINK, 5, "docker0", "device"), options{
-		InterfaceTypes:          []string{"device"},
-		IgnoredInterfaceRegexps: []string{"^docker"},
-	}) {
-		t.Fatal("expected ignored matching interface update to be ignored")
-	}
-}
-
-func TestShouldReconcileLinkUpdateIgnoresUnselectedInterface(t *testing.T) {
-	manager := newEgressManager(nil)
-
-	if manager.shouldReconcileLinkUpdate(linkUpdate(unix.RTM_NEWLINK, 5, "veth0", "veth"), options{
-		InterfaceRegexps: []string{"^wl"},
-	}) {
-		t.Fatal("expected unselected interface update to be ignored")
 	}
 }
 
@@ -1143,18 +1184,4 @@ func netipMustParse(value string) netip.Addr {
 		panic(err)
 	}
 	return addr
-}
-
-func linkUpdate(msgType uint16, index int, name string, typ string) netlink.LinkUpdate {
-	link := &netlink.GenericLink{
-		LinkAttrs: netlink.LinkAttrs{
-			Index: index,
-			Name:  name,
-		},
-		LinkType: typ,
-	}
-	return netlink.LinkUpdate{
-		Header: unix.NlMsghdr{Type: msgType},
-		Link:   link,
-	}
 }

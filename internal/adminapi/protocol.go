@@ -165,18 +165,24 @@ type CurrentConfig struct {
 }
 
 type Interface struct {
-	Index      int      `json:"index"`
-	Name       string   `json:"name"`
-	Type       string   `json:"type"`
-	Addrs      []string `json:"addrs,omitempty"`
-	Matched    bool     `json:"matched"`
-	Killswitch bool     `json:"killswitch"`
+	Index       int      `json:"index"`
+	Name        string   `json:"name"`
+	Type        string   `json:"type"`
+	Addrs       []string `json:"addrs,omitempty"`
+	SSID        string   `json:"ssid,omitempty"`
+	BSSID       string   `json:"bssid,omitempty"`
+	GatewayMACs []string `json:"gateway_macs,omitempty"`
+	Matched     bool     `json:"matched"`
+	Killswitch  bool     `json:"killswitch"`
 }
 
 type InterfacePolicy struct {
 	Index             int        `json:"index"`
 	Name              string     `json:"name"`
 	Type              string     `json:"type"`
+	SSID              string     `json:"ssid,omitempty"`
+	BSSID             string     `json:"bssid,omitempty"`
+	GatewayMACs       []string   `json:"gateway_macs,omitempty"`
 	Matched           bool       `json:"matched"`
 	Attached          bool       `json:"attached"`
 	EffectivePolicy   AllowRules `json:"effective_policy"`
@@ -244,6 +250,9 @@ type RulesetTrigger struct {
 	InterfaceNames   []string `json:"interface_names,omitempty"`
 	InterfaceRegexps []string `json:"interface_regexps,omitempty"`
 	IPAddrs          []string `json:"ip_addrs,omitempty"`
+	SSIDs            []string `json:"ssids,omitempty"`
+	BSSIDs           []string `json:"bssids,omitempty"`
+	GatewayMACs      []string `json:"gateway_macs,omitempty"`
 }
 
 func WriteMessage(encoder *json.Encoder, msg Message) error {

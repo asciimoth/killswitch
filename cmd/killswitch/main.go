@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"os/signal"
 	"reflect"
 	"regexp"
@@ -29,7 +30,6 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -181,6 +181,9 @@ type rulesetTrigger struct {
 	InterfaceNames   []string
 	InterfaceRegexps []string
 	IPAddrs          []netip.Addr
+	SSIDs            []string
+	BSSIDs           []string
+	GatewayMACs      []string
 }
 
 type configFile struct {
@@ -224,13 +227,19 @@ type triggerConfig struct {
 	InterfaceNames   []string `json:"interface_names"`
 	InterfaceRegexps []string `json:"interface_regexps"`
 	IPAddrs          []string `json:"ip_addrs"`
+	SSIDs            []string `json:"ssids"`
+	BSSIDs           []string `json:"bssids"`
+	GatewayMACs      []string `json:"gateway_macs"`
 }
 
 type interfaceInfo struct {
-	Index int
-	Name  string
-	Type  string
-	Addrs []netip.Addr
+	Index       int
+	Name        string
+	Type        string
+	Addrs       []netip.Addr
+	SSID        string
+	BSSID       string
+	GatewayMACs []string
 }
 
 type attachedInterface struct {
@@ -431,6 +440,7 @@ func triggerFromConfig(cfg triggerConfig) (rulesetTrigger, error) {
 		InterfaceTypes:   cfg.InterfaceTypes,
 		InterfaceNames:   cfg.InterfaceNames,
 		InterfaceRegexps: cfg.InterfaceRegexps,
+		SSIDs:            cfg.SSIDs,
 	}
 	for _, pattern := range trigger.InterfaceRegexps {
 		if _, err := regexp.Compile(pattern); err != nil {
@@ -444,8 +454,15 @@ func triggerFromConfig(cfg triggerConfig) (rulesetTrigger, error) {
 		}
 		trigger.IPAddrs = append(trigger.IPAddrs, addr.Unmap())
 	}
-	if len(trigger.InterfaceTypes) == 0 && len(trigger.InterfaceNames) == 0 && len(trigger.InterfaceRegexps) == 0 && len(trigger.IPAddrs) == 0 {
-		return rulesetTrigger{}, errors.New("trigger requires at least one interface_types, interface_names, interface_regexps, or ip_addrs entry")
+	var err error
+	if trigger.BSSIDs, err = normalizeMACList("trigger bssids", cfg.BSSIDs); err != nil {
+		return rulesetTrigger{}, err
+	}
+	if trigger.GatewayMACs, err = normalizeMACList("trigger gateway_macs", cfg.GatewayMACs); err != nil {
+		return rulesetTrigger{}, err
+	}
+	if !rulesetTriggerHasPredicates(trigger) {
+		return rulesetTrigger{}, errors.New("trigger requires at least one interface_types, interface_names, interface_regexps, ip_addrs, ssids, bssids, or gateway_macs entry")
 	}
 	return trigger, nil
 }
@@ -817,11 +834,30 @@ func mutateRulesetField(rulesets *[]ruleset, field string, req adminapi.Mutation
 			InterfaceNames:   rs.Trigger.InterfaceNames,
 			InterfaceRegexps: rs.Trigger.InterfaceRegexps,
 			IPAddrs:          apiTrigger.IPAddrs,
+			SSIDs:            rs.Trigger.SSIDs,
+			BSSIDs:           rs.Trigger.BSSIDs,
+			GatewayMACs:      rs.Trigger.GatewayMACs,
 		})
 		if err != nil {
 			return err
 		}
 		rs.Trigger = trigger
+	case "trigger.ssids":
+		if err := mutateStringList(&rs.Trigger.SSIDs, req); err != nil {
+			return err
+		}
+	case "trigger.bssids":
+		values, err := mutatedMACList("ruleset trigger bssids", rs.Trigger.BSSIDs, req)
+		if err != nil {
+			return err
+		}
+		rs.Trigger.BSSIDs = values
+	case "trigger.gateway_macs":
+		values, err := mutatedMACList("ruleset trigger gateway_macs", rs.Trigger.GatewayMACs, req)
+		if err != nil {
+			return err
+		}
+		rs.Trigger.GatewayMACs = values
 	case "policy.allow_all", "policy.enable_v4", "policy.enable_v6",
 		"policy.allowed_marks", "policy.allowed_ports", "policy.allowed_v4_hosts",
 		"policy.allowed_v6_hosts", "policy.allowed_v4_hostports", "policy.allowed_v6_hostports":
@@ -831,12 +867,20 @@ func mutateRulesetField(rulesets *[]ruleset, field string, req adminapi.Mutation
 	default:
 		return fmt.Errorf("unsupported ruleset field %q", field)
 	}
-	if len(rs.Trigger.InterfaceTypes) == 0 && len(rs.Trigger.InterfaceNames) == 0 && len(rs.Trigger.InterfaceRegexps) == 0 && len(rs.Trigger.IPAddrs) == 0 {
-		return errors.New("trigger requires at least one interface_types, interface_names, interface_regexps, or ip_addrs entry")
+	if !rulesetTriggerHasPredicates(rs.Trigger) {
+		return errors.New("trigger requires at least one interface_types, interface_names, interface_regexps, ip_addrs, ssids, bssids, or gateway_macs entry")
 	}
 	(*rulesets)[idx] = rs
 	sortRulesets(*rulesets)
 	return nil
+}
+
+func mutatedMACList(field string, current []string, req adminapi.MutationRequest) ([]string, error) {
+	values := cloneStrings(current)
+	if err := mutateStringList(&values, req); err != nil {
+		return nil, err
+	}
+	return normalizeMACList(field, values)
 }
 
 func allowRulesFromAPI(policyPtr *adminapi.AllowRules, raw json.RawMessage) (allowRules, error) {
@@ -892,6 +936,9 @@ func rulesetFromAPI(name string, rulesetPtr *adminapi.RulesetMutation, raw json.
 		InterfaceNames:   api.Trigger.InterfaceNames,
 		InterfaceRegexps: api.Trigger.InterfaceRegexps,
 		IPAddrs:          api.Trigger.IPAddrs,
+		SSIDs:            api.Trigger.SSIDs,
+		BSSIDs:           api.Trigger.BSSIDs,
+		GatewayMACs:      api.Trigger.GatewayMACs,
 	})
 	if err != nil {
 		return ruleset{}, err
@@ -932,6 +979,26 @@ func uniqueSortedStrings(values []string) []string {
 	out := uniqueStrings(values)
 	sort.Strings(out)
 	return out
+}
+
+func normalizeMAC(value string) string {
+	hw, err := net.ParseMAC(strings.TrimSpace(value))
+	if err != nil {
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+	return strings.ToLower(hw.String())
+}
+
+func normalizeMACList(field string, values []string) ([]string, error) {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		hw, err := net.ParseMAC(strings.TrimSpace(value))
+		if err != nil {
+			return nil, fmt.Errorf("parse %s %q: %w", field, value, err)
+		}
+		out = append(out, strings.ToLower(hw.String()))
+	}
+	return uniqueSortedStrings(out), nil
 }
 
 func stringInSlice(value string, values []string) bool {
@@ -1023,6 +1090,9 @@ func cloneRulesetTrigger(trigger rulesetTrigger) rulesetTrigger {
 		InterfaceNames:   cloneStrings(trigger.InterfaceNames),
 		InterfaceRegexps: cloneStrings(trigger.InterfaceRegexps),
 		IPAddrs:          append([]netip.Addr(nil), trigger.IPAddrs...),
+		SSIDs:            cloneStrings(trigger.SSIDs),
+		BSSIDs:           cloneStrings(trigger.BSSIDs),
+		GatewayMACs:      cloneStrings(trigger.GatewayMACs),
 	}
 }
 
@@ -1218,14 +1288,78 @@ func listInterfaces() ([]interfaceInfo, error) {
 		if err != nil {
 			return nil, err
 		}
+		ssid, bssid := wifiLinkInfo(attrs.Name)
+		gatewayMACs, err := interfaceGatewayMACs(l)
+		if err != nil {
+			return nil, err
+		}
 		all = append(all, interfaceInfo{
-			Index: attrs.Index,
-			Name:  attrs.Name,
-			Type:  l.Type(),
-			Addrs: addrs,
+			Index:       attrs.Index,
+			Name:        attrs.Name,
+			Type:        l.Type(),
+			Addrs:       addrs,
+			SSID:        ssid,
+			BSSID:       bssid,
+			GatewayMACs: gatewayMACs,
 		})
 	}
 	return all, nil
+}
+
+func wifiLinkInfo(ifaceName string) (string, string) {
+	output, err := exec.Command("iw", "dev", ifaceName, "link").Output()
+	if err != nil {
+		return "", ""
+	}
+	return parseIWLinkInfo(string(output))
+}
+
+func parseIWLinkInfo(output string) (string, string) {
+	var ssid, bssid string
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "Connected to "):
+			fields := strings.Fields(line)
+			if len(fields) >= 3 {
+				bssid = normalizeMAC(fields[2])
+			}
+		case strings.HasPrefix(line, "SSID:"):
+			ssid = strings.TrimSpace(strings.TrimPrefix(line, "SSID:"))
+		}
+	}
+	return ssid, bssid
+}
+
+func interfaceGatewayMACs(link netlink.Link) ([]string, error) {
+	attrs := link.Attrs()
+	if attrs == nil {
+		return nil, nil
+	}
+	routes, err := netlink.RouteList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		return nil, fmt.Errorf("list routes for %s(index %d): %w", attrs.Name, attrs.Index, err)
+	}
+	neighs, err := netlink.NeighList(attrs.Index, netlink.FAMILY_ALL)
+	if err != nil {
+		return nil, fmt.Errorf("list neighbors for %s(index %d): %w", attrs.Name, attrs.Index, err)
+	}
+
+	var out []string
+	for _, route := range routes {
+		if route.Gw == nil || route.Gw.IsUnspecified() {
+			continue
+		}
+		for _, neigh := range neighs {
+			if neigh.IP == nil || neigh.HardwareAddr == nil {
+				continue
+			}
+			if route.Gw.Equal(neigh.IP) {
+				out = append(out, normalizeMAC(neigh.HardwareAddr.String()))
+			}
+		}
+	}
+	return uniqueSortedStrings(out), nil
 }
 
 func interfaceAddrs(link netlink.Link) ([]netip.Addr, error) {
@@ -1641,6 +1775,9 @@ func apiRulesets(rulesets []ruleset, activeNames map[string]bool) []adminapi.Rul
 				InterfaceNames:   cloneStrings(ruleset.Trigger.InterfaceNames),
 				InterfaceRegexps: cloneStrings(ruleset.Trigger.InterfaceRegexps),
 				IPAddrs:          apiAddrs(ruleset.Trigger.IPAddrs),
+				SSIDs:            cloneStrings(ruleset.Trigger.SSIDs),
+				BSSIDs:           cloneStrings(ruleset.Trigger.BSSIDs),
+				GatewayMACs:      cloneStrings(ruleset.Trigger.GatewayMACs),
 			},
 			Policy: apiAllowRules(ruleset.allowRules),
 		})
@@ -1700,6 +1837,9 @@ func apiInterfacePolicies(current map[int]interfacePolicy) []adminapi.InterfaceP
 			Index:             p.Info.Index,
 			Name:              p.Info.Name,
 			Type:              p.Info.Type,
+			SSID:              p.Info.SSID,
+			BSSID:             p.Info.BSSID,
+			GatewayMACs:       cloneStrings(p.Info.GatewayMACs),
 			Matched:           true,
 			Attached:          true,
 			EffectivePolicy:   apiAllowRules(p.Rules),
@@ -1834,12 +1974,15 @@ func apiInterfaces(all []interfaceInfo, opts options, manager *egressManager, no
 			}
 		}
 		out = append(out, adminapi.Interface{
-			Index:      iface.Index,
-			Name:       iface.Name,
-			Type:       iface.Type,
-			Addrs:      apiAddrs(iface.Addrs),
-			Matched:    matched,
-			Killswitch: attached[iface.Index],
+			Index:       iface.Index,
+			Name:        iface.Name,
+			Type:        iface.Type,
+			Addrs:       apiAddrs(iface.Addrs),
+			SSID:        iface.SSID,
+			BSSID:       iface.BSSID,
+			GatewayMACs: cloneStrings(iface.GatewayMACs),
+			Matched:     matched,
+			Killswitch:  attached[iface.Index],
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -1866,7 +2009,7 @@ func cloneStrings(values []string) []string {
 }
 
 func rulesetTriggerMatchesInterface(iface interfaceInfo, trigger rulesetTrigger, matchAll bool) bool {
-	total := len(trigger.InterfaceTypes) + len(trigger.InterfaceNames) + len(trigger.InterfaceRegexps) + len(trigger.IPAddrs)
+	total := rulesetTriggerPredicateCount(trigger)
 	if total == 0 {
 		return false
 	}
@@ -1895,10 +2038,33 @@ func rulesetTriggerMatchesInterface(iface interfaceInfo, trigger rulesetTrigger,
 			}
 		}
 	}
+	for _, ssid := range trigger.SSIDs {
+		if iface.SSID == ssid {
+			matched++
+		}
+	}
+	for _, bssid := range trigger.BSSIDs {
+		if iface.BSSID == bssid {
+			matched++
+		}
+	}
+	for _, gatewayMAC := range trigger.GatewayMACs {
+		if stringInSlice(gatewayMAC, iface.GatewayMACs) {
+			matched++
+		}
+	}
 	if matchAll {
 		return matched == total
 	}
 	return matched > 0
+}
+
+func rulesetTriggerHasPredicates(trigger rulesetTrigger) bool {
+	return rulesetTriggerPredicateCount(trigger) > 0
+}
+
+func rulesetTriggerPredicateCount(trigger rulesetTrigger) int {
+	return len(trigger.InterfaceTypes) + len(trigger.InterfaceNames) + len(trigger.InterfaceRegexps) + len(trigger.IPAddrs) + len(trigger.SSIDs) + len(trigger.BSSIDs) + len(trigger.GatewayMACs)
 }
 
 func writeRuntimeConfig(m *ebpf.Map, ifindex uint32, config runtimeConfig) error {
@@ -2181,6 +2347,7 @@ func cloneInterfacePolicyMap(values map[int]interfacePolicy) map[int]interfacePo
 	out := make(map[int]interfacePolicy, len(values))
 	for index, value := range values {
 		value.Info.Addrs = append([]netip.Addr(nil), value.Info.Addrs...)
+		value.Info.GatewayMACs = cloneStrings(value.Info.GatewayMACs)
 		value.Rules = cloneAllowRules(value.Rules)
 		value.ActiveRulesets = cloneStrings(value.ActiveRulesets)
 		value.ForcedRulesets = cloneStrings(value.ForcedRulesets)
@@ -2484,6 +2651,8 @@ func (m *egressManager) close() {
 func watchInterfaces(ctx context.Context, manager *egressManager, policies *policyManager, reconcileMu *sync.Mutex, notify func(adminapi.EventType)) error {
 	linkUpdates := make(chan netlink.LinkUpdate, 32)
 	addrUpdates := make(chan netlink.AddrUpdate, 32)
+	routeUpdates := make(chan netlink.RouteUpdate, 32)
+	neighUpdates := make(chan netlink.NeighUpdate, 32)
 	done := make(chan struct{})
 	defer close(done)
 
@@ -2506,6 +2675,16 @@ func watchInterfaces(ctx context.Context, manager *egressManager, policies *poli
 	}); err != nil {
 		return fmt.Errorf("subscribe to netlink addr updates: %w", err)
 	}
+	if err := netlink.RouteSubscribeWithOptions(routeUpdates, done, netlink.RouteSubscribeOptions{
+		ErrorCallback: errCallback,
+	}); err != nil {
+		return fmt.Errorf("subscribe to netlink route updates: %w", err)
+	}
+	if err := netlink.NeighSubscribeWithOptions(neighUpdates, done, netlink.NeighSubscribeOptions{
+		ErrorCallback: errCallback,
+	}); err != nil {
+		return fmt.Errorf("subscribe to netlink neighbor updates: %w", err)
+	}
 
 	if _, err := manager.reconcileCurrent(policies.optionsSnapshot(), true); err != nil {
 		return err
@@ -2526,22 +2705,51 @@ func watchInterfaces(ctx context.Context, manager *egressManager, policies *poli
 		case <-ctx.Done():
 			return nil
 		case err := <-subscribeErrs:
-			return fmt.Errorf("netlink link watcher: %w", err)
-		case update := <-linkUpdates:
+			return fmt.Errorf("netlink watcher: %w", err)
+		case <-linkUpdates:
 			reconcileMu.Lock()
 			opts := policies.optionsSnapshot()
-			shouldReconcileAttachments := manager.shouldReconcileLinkUpdate(update, opts)
-			interfacesChanged := false
-			if shouldReconcileAttachments {
-				var err error
-				interfacesChanged, err = manager.reconcileCurrent(opts, false)
-				if err != nil {
-					log.Printf("ERROR: reconcile interfaces after netlink update: %s", err)
-				}
+			interfacesChanged, err := manager.reconcileCurrent(opts, false)
+			if err != nil {
+				log.Printf("ERROR: reconcile interfaces after netlink link update: %s", err)
 			}
 			policyChanged, err := policies.reconcileAttached(manager, true)
 			if err != nil {
 				log.Printf("ERROR: reconcile rulesets after netlink link update: %s", err)
+			}
+			reconcileMu.Unlock()
+			if notify != nil {
+				notify(adminapi.EventTypeInterfaces)
+				if interfacesChanged || policyChanged {
+					notify(adminapi.EventTypeConfig)
+				}
+			}
+		case <-addrUpdates:
+			reconcileMu.Lock()
+			_, err := manager.reconcileCurrent(policies.optionsSnapshot(), false)
+			if err != nil {
+				log.Printf("ERROR: reconcile interfaces after netlink addr update: %s", err)
+			}
+			policyChanged, err := policies.reconcileAttached(manager, true)
+			if err != nil {
+				log.Printf("ERROR: reconcile rulesets after netlink addr update: %s", err)
+			}
+			reconcileMu.Unlock()
+			if notify != nil {
+				notify(adminapi.EventTypeInterfaces)
+				if policyChanged {
+					notify(adminapi.EventTypeConfig)
+				}
+			}
+		case <-routeUpdates:
+			reconcileMu.Lock()
+			interfacesChanged, err := manager.reconcileCurrent(policies.optionsSnapshot(), false)
+			if err != nil {
+				log.Printf("ERROR: reconcile interfaces after netlink route update: %s", err)
+			}
+			policyChanged, err := policies.reconcileAttached(manager, true)
+			if err != nil {
+				log.Printf("ERROR: reconcile rulesets after netlink route update: %s", err)
 			}
 			reconcileMu.Unlock()
 			if notify != nil {
@@ -2552,53 +2760,27 @@ func watchInterfaces(ctx context.Context, manager *egressManager, policies *poli
 					notify(adminapi.EventTypeConfig)
 				}
 			}
-		case <-addrUpdates:
+		case <-neighUpdates:
 			reconcileMu.Lock()
+			interfacesChanged, err := manager.reconcileCurrent(policies.optionsSnapshot(), false)
+			if err != nil {
+				log.Printf("ERROR: reconcile interfaces after netlink neighbor update: %s", err)
+			}
 			policyChanged, err := policies.reconcileAttached(manager, true)
 			if err != nil {
-				log.Printf("ERROR: reconcile rulesets after netlink addr update: %s", err)
+				log.Printf("ERROR: reconcile rulesets after netlink neighbor update: %s", err)
 			}
 			reconcileMu.Unlock()
 			if notify != nil {
-				if policyChanged {
+				if interfacesChanged {
 					notify(adminapi.EventTypeInterfaces)
+				}
+				if policyChanged {
 					notify(adminapi.EventTypeConfig)
 				}
 			}
 		}
 	}
-}
-
-func (m *egressManager) shouldReconcileLinkUpdate(update netlink.LinkUpdate, opts options) bool {
-	if update.Link == nil || update.Link.Attrs() == nil { //nolint:staticcheck
-		return true
-	}
-
-	attrs := update.Link.Attrs() //nolint:staticcheck
-	switch update.Header.Type {
-	case unix.RTM_DELLINK:
-		return m.isAttached(attrs.Index)
-	case unix.RTM_NEWLINK:
-		matches, err := interfaceMatchesSelectors(interfaceInfo{
-			Index: attrs.Index,
-			Name:  attrs.Name,
-			Type:  update.Link.Type(), //nolint:staticcheck
-		}, opts)
-		if err != nil {
-			log.Printf("ERROR: match netlink link update selectors: %s", err)
-			return true
-		}
-		return matches != m.isAttached(attrs.Index)
-	default:
-		return false
-	}
-}
-
-func (m *egressManager) isAttached(index int) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	_, ok := m.attached[index]
-	return ok
 }
 
 func interfaceMatchesSelectors(iface interfaceInfo, opts options) (bool, error) {

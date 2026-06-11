@@ -733,6 +733,9 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 		for _, iface := range cfg.Interfaces {
 			printer.printf("    %s:\tindex=%d type=%s matched=%t killswitch=%t\n", iface.Name, iface.Index, iface.Type, iface.Matched, iface.Killswitch)
 			printer.printList("      addrs", iface.Addrs)
+			printer.printOptional("      ssid", iface.SSID)
+			printer.printOptional("      bssid", iface.BSSID)
+			printer.printList("      gateway MACs", iface.GatewayMACs)
 		}
 	}
 	printer.println()
@@ -745,6 +748,9 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 	if len(cfg.EffectiveInterfaces) > 0 {
 		for _, iface := range cfg.EffectiveInterfaces {
 			printer.printf("  %s:\tindex=%d type=%s attached=%t matched=%t\n", iface.Name, iface.Index, iface.Type, iface.Attached, iface.Matched)
+			printer.printOptional("    ssid", iface.SSID)
+			printer.printOptional("    bssid", iface.BSSID)
+			printer.printList("    gateway MACs", iface.GatewayMACs)
 			printer.printList("    active rulesets", iface.ActiveRulesets)
 			printer.printList("    forced rulesets", iface.ForcedRulesets)
 			printer.printList("    temporary rulesets", iface.TemporaryRulesets)
@@ -768,6 +774,9 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 			printer.printList("    trigger names", ruleset.Trigger.InterfaceNames)
 			printer.printList("    trigger regexps", ruleset.Trigger.InterfaceRegexps)
 			printer.printList("    trigger IPs", ruleset.Trigger.IPAddrs)
+			printer.printList("    trigger SSIDs", ruleset.Trigger.SSIDs)
+			printer.printList("    trigger BSSIDs", ruleset.Trigger.BSSIDs)
+			printer.printList("    trigger gateway MACs", ruleset.Trigger.GatewayMACs)
 			printer.printAllowRulesWithPrefix("    ", ruleset.Policy)
 		}
 	}
@@ -849,6 +858,14 @@ func (p *outputPrinter) printList(label string, values []string) {
 		return
 	}
 	p.printf("%s:\t%s\n", label, strings.Join(values, ", "))
+}
+
+func (p *outputPrinter) printOptional(label, value string) {
+	if value == "" {
+		p.printf("%s:\t-\n", label)
+		return
+	}
+	p.printf("%s:\t%s\n", label, value)
 }
 
 func (p *outputPrinter) printEventTypes(label string, values []adminapi.EventType) {
