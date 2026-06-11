@@ -62,10 +62,12 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 }
 
 func runNotifications(args []string, stdout, stderr io.Writer) error {
+	jsonOutArg, args := extractJSONOutArg(args)
 	flags := flag.NewFlagSet("notifications", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
 	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	jsonOut := flags.Bool("json-out", jsonOutArg, "print compact JSON output")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -81,10 +83,10 @@ func runNotifications(args []string, stdout, stderr io.Writer) error {
 	if err := client.Subscribe(adminapi.EventTypeNotification); err != nil {
 		return err
 	}
-	return watchNotifications(client, stdout)
+	return watchNotifications(client, stdout, *jsonOut)
 }
 
-func watchNotifications(client *adminapi.Client, stdout io.Writer) error {
+func watchNotifications(client *adminapi.Client, stdout io.Writer, jsonOut bool) error {
 	events := make(chan adminapi.Notification, 1)
 	errs := make(chan error, 1)
 	go func() {
@@ -105,6 +107,12 @@ func watchNotifications(client *adminapi.Client, stdout io.Writer) error {
 	for {
 		select {
 		case notification := <-events:
+			if jsonOut {
+				if err := printJSONLine(stdout, notification); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := printNotification(stdout, notification); err != nil {
 				return err
 			}
@@ -120,6 +128,7 @@ func watchNotifications(client *adminapi.Client, stdout io.Writer) error {
 }
 
 func runDebugNotify(args []string, stdout, stderr io.Writer) error {
+	jsonOutArg, args := extractJSONOutArg(args)
 	flags := flag.NewFlagSet("debug-notify", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
@@ -127,6 +136,7 @@ func runDebugNotify(args []string, stdout, stderr io.Writer) error {
 	level := flags.String("level", string(adminapi.NotificationLevelNormal), "notification level: normal, warn, or error")
 	header := flags.String("header", "", "optional notification header")
 	text := flags.String("text", "", "notification text")
+	jsonOut := flags.Bool("json-out", jsonOutArg, "print compact JSON output")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -154,17 +164,22 @@ func runDebugNotify(args []string, stdout, stderr io.Writer) error {
 	if !result.OK {
 		return errors.New(result.Error)
 	}
+	if *jsonOut {
+		return printJSONLine(stdout, result)
+	}
 	_, err = fmt.Fprintln(stdout, "sent")
 	return err
 }
 
 func runTemporaryRuleset(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	jsonOutArg, args := extractJSONOutArg(args)
 	flags := flag.NewFlagSet("tmp-ruleset", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
 	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
 	jsonValue := flags.String("json", "", "temporary allow-rules JSON; prefix with @ to read a file")
 	interfaces := flags.String("interfaces", "", "comma-separated interface names this temporary ruleset affects")
+	jsonOut := flags.Bool("json-out", jsonOutArg, "print compact JSON output")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -201,8 +216,14 @@ func runTemporaryRuleset(args []string, stdin io.Reader, stdout, stderr io.Write
 	if !result.OK {
 		return errors.New(result.Error)
 	}
-	if _, err := fmt.Fprintf(stdout, "temporary ruleset installed for %s; press Ctrl+C, Ctrl+D, or Esc to remove it\n", strings.Join(interfaceNames, ", ")); err != nil {
-		return err
+	if *jsonOut {
+		if err := printJSONLine(stdout, result); err != nil {
+			return err
+		}
+	} else {
+		if _, err := fmt.Fprintf(stdout, "temporary ruleset installed for %s; press Ctrl+C, Ctrl+D, or Esc to remove it\n", strings.Join(interfaceNames, ", ")); err != nil {
+			return err
+		}
 	}
 	restoreInput, err := rawInputMode(stdin)
 	if err != nil {
@@ -243,6 +264,7 @@ func runTemporaryRuleset(args []string, stdin io.Reader, stdout, stderr io.Write
 }
 
 func runForceRuleset(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	jsonOutArg, args := extractJSONOutArg(args)
 	flags := flag.NewFlagSet("force-ruleset", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
@@ -250,6 +272,7 @@ func runForceRuleset(args []string, stdin io.Reader, stdout, stderr io.Writer) e
 	ruleset := flags.String("ruleset", "", "ruleset name to force activate")
 	flags.StringVar(ruleset, "r", "", "ruleset name to force activate")
 	interfaces := flags.String("interfaces", "", "comma-separated interface names this forced ruleset affects")
+	jsonOut := flags.Bool("json-out", jsonOutArg, "print compact JSON output")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -282,8 +305,14 @@ func runForceRuleset(args []string, stdin io.Reader, stdout, stderr io.Writer) e
 	if !result.OK {
 		return errors.New(result.Error)
 	}
-	if _, err := fmt.Fprintf(stdout, "ruleset %q force activated for %s; press Ctrl+C, Ctrl+D, or Esc to release it\n", *ruleset, strings.Join(interfaceNames, ", ")); err != nil {
-		return err
+	if *jsonOut {
+		if err := printJSONLine(stdout, result); err != nil {
+			return err
+		}
+	} else {
+		if _, err := fmt.Fprintf(stdout, "ruleset %q force activated for %s; press Ctrl+C, Ctrl+D, or Esc to release it\n", *ruleset, strings.Join(interfaceNames, ", ")); err != nil {
+			return err
+		}
 	}
 	restoreInput, err := rawInputMode(stdin)
 	if err != nil {
@@ -366,7 +395,7 @@ func waitForStopInput(r io.Reader) error {
 }
 
 func runMutation(op adminapi.MutationOperation, args []string, stdout, stderr io.Writer) error {
-	req, socketPath, err := mutationRequestFromArgs(op, args, stderr)
+	req, socketPath, jsonOut, err := mutationRequestFromArgs(op, args, stderr)
 	if err != nil {
 		return err
 	}
@@ -384,6 +413,9 @@ func runMutation(op adminapi.MutationOperation, args []string, stdout, stderr io
 	if !result.OK {
 		return errors.New(result.Error)
 	}
+	if jsonOut {
+		return printJSONLine(stdout, result)
+	}
 	if result.Changed {
 		_, err = fmt.Fprintln(stdout, "changed")
 	} else {
@@ -392,7 +424,21 @@ func runMutation(op adminapi.MutationOperation, args []string, stdout, stderr io
 	return err
 }
 
-func mutationRequestFromArgs(op adminapi.MutationOperation, args []string, stderr io.Writer) (adminapi.MutationRequest, string, error) {
+func extractJSONOutArg(args []string) (bool, []string) {
+	out := args[:0]
+	jsonOut := false
+	for _, arg := range args {
+		if arg == "--json-out" {
+			jsonOut = true
+			continue
+		}
+		out = append(out, arg)
+	}
+	return jsonOut, out
+}
+
+func mutationRequestFromArgs(op adminapi.MutationOperation, args []string, stderr io.Writer) (adminapi.MutationRequest, string, bool, error) {
+	jsonOutArg, args := extractJSONOutArg(args)
 	flags := flag.NewFlagSet(string(op), flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
@@ -402,11 +448,12 @@ func mutationRequestFromArgs(op adminapi.MutationOperation, args []string, stder
 	ruleset := flags.String("ruleset", "", "ruleset name for ruleset mutations")
 	flags.StringVar(ruleset, "r", "", "ruleset name for ruleset mutations")
 	jsonValue := flags.String("json", "", "JSON value for boolean, policy, or ruleset add/set operations; prefix with @ to read a file")
+	jsonOut := flags.Bool("json-out", jsonOutArg, "print compact JSON output")
 	if err := flags.Parse(args); err != nil {
-		return adminapi.MutationRequest{}, "", err
+		return adminapi.MutationRequest{}, "", false, err
 	}
 	if *target == "" {
-		return adminapi.MutationRequest{}, "", fmt.Errorf("%s requires -target", op)
+		return adminapi.MutationRequest{}, "", false, fmt.Errorf("%s requires -target", op)
 	}
 
 	req := adminapi.MutationRequest{
@@ -418,22 +465,22 @@ func mutationRequestFromArgs(op adminapi.MutationOperation, args []string, stder
 	if *jsonValue != "" {
 		raw, err := readJSONArgument(*jsonValue)
 		if err != nil {
-			return adminapi.MutationRequest{}, "", err
+			return adminapi.MutationRequest{}, "", false, err
 		}
 		req.Value = raw
 	}
 	if len(req.Value) == 0 && op == adminapi.MutationSet && len(req.Values) == 1 && scalarTarget(*target) {
 		raw, err := scalarJSONValue(req.Values[0])
 		if err != nil {
-			return adminapi.MutationRequest{}, "", err
+			return adminapi.MutationRequest{}, "", false, err
 		}
 		req.Value = raw
 		req.Values = nil
 	}
 	if err := validateMutationRequest(req, *jsonValue != ""); err != nil {
-		return adminapi.MutationRequest{}, "", err
+		return adminapi.MutationRequest{}, "", false, err
 	}
-	return req, *socketPath, nil
+	return req, *socketPath, *jsonOut, nil
 }
 
 func validateMutationRequest(req adminapi.MutationRequest, hasJSON bool) error {
@@ -513,11 +560,13 @@ func scalarJSONValue(value string) (json.RawMessage, error) {
 }
 
 func runGetConfig(args []string, stdout, stderr io.Writer) error {
+	jsonOutArg, args := extractJSONOutArg(args)
 	flags := flag.NewFlagSet("get-cfg", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
 	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
 	watch := flags.Bool("watch", false, "subscribe to config, interface, and client events and re-print on updates")
+	jsonOut := flags.Bool("json-out", jsonOutArg, "print compact JSON output")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -543,6 +592,15 @@ func runGetConfig(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if *jsonOut {
+		if !*watch {
+			return printJSONLine(stdout, cfg)
+		}
+		if err := printJSONLine(stdout, configUpdate{Config: cfg}); err != nil {
+			return err
+		}
+		return watchConfigJSON(client, stdout)
+	}
 	if err := printConfig(stdout, cfg); err != nil {
 		return err
 	}
@@ -550,6 +608,11 @@ func runGetConfig(args []string, stdout, stderr io.Writer) error {
 		return nil
 	}
 	return watchConfig(client, stdout)
+}
+
+type configUpdate struct {
+	EventType adminapi.EventType     `json:"event_type,omitempty"`
+	Config    adminapi.CurrentConfig `json:"config"`
 }
 
 func watchConfig(client *adminapi.Client, stdout io.Writer) error {
@@ -590,12 +653,53 @@ func watchConfig(client *adminapi.Client, stdout io.Writer) error {
 	}
 }
 
+func watchConfigJSON(client *adminapi.Client, stdout io.Writer) error {
+	events := make(chan adminapi.EventMessage, 1)
+	errs := make(chan error, 1)
+	go func() {
+		for {
+			event, err := client.WaitForEvent()
+			if err != nil {
+				errs <- err
+				return
+			}
+			events <- event
+		}
+	}()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	for {
+		select {
+		case event := <-events:
+			if err := printJSONLine(stdout, configUpdate{EventType: event.EventType, Config: event.Config}); err != nil {
+				return err
+			}
+		case err := <-errs:
+			if adminapi.IsEOF(err) {
+				return errors.New("server disconnected")
+			}
+			return err
+		case <-signals:
+			return nil
+		}
+	}
+}
+
 func printUsage(w io.Writer) error {
 	if _, err := fmt.Fprintln(w, "Usage:"); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch]\n  killswitch-cli notifications [-socket PATH]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target ruleset -ruleset NAME\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -interfaces NAME[,NAME...] -json JSON|-json @FILE\n  killswitch-cli force-ruleset [-socket PATH] -interfaces NAME[,NAME...] -ruleset NAME")
+	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch] [--json-out]\n  killswitch-cli notifications [-socket PATH] [--json-out]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT [--json-out]\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE] [--json-out]\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE... [--json-out]\n  killswitch-cli remove [-socket PATH] -target ruleset -ruleset NAME [--json-out]\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE] [--json-out]\n  killswitch-cli tmp-ruleset [-socket PATH] -interfaces NAME[,NAME...] -json JSON|-json @FILE [--json-out]\n  killswitch-cli force-ruleset [-socket PATH] -interfaces NAME[,NAME...] -ruleset NAME [--json-out]")
 	return err
+}
+
+func printJSONLine(w io.Writer, value any) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(value)
 }
 
 func printNotification(w io.Writer, notification adminapi.Notification) error {

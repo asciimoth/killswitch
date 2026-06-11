@@ -115,7 +115,7 @@ func TestWaitForStopInputStopsOnEscapeAndEOF(t *testing.T) {
 
 func TestMutationRequestFromArgsAddsNamedRuleset(t *testing.T) {
 	raw := `{"trigger":{"interface_names":["wg0"]},"policy":{"enable_v4":true}}`
-	req, socketPath, err := mutationRequestFromArgs(adminapi.MutationAdd, []string{
+	req, socketPath, jsonOut, err := mutationRequestFromArgs(adminapi.MutationAdd, []string{
 		"-socket", "/tmp/killswitch-test.sock",
 		"-target", "ruleset",
 		"-ruleset", "wireguard-up",
@@ -126,6 +126,9 @@ func TestMutationRequestFromArgsAddsNamedRuleset(t *testing.T) {
 	}
 	if socketPath != "/tmp/killswitch-test.sock" {
 		t.Fatalf("socket path = %q", socketPath)
+	}
+	if jsonOut {
+		t.Fatal("jsonOut = true, want false")
 	}
 	if req.Operation != adminapi.MutationAdd || req.Target != "ruleset" || req.Ruleset != "wireguard-up" {
 		t.Fatalf("request metadata = %+v", req)
@@ -139,7 +142,7 @@ func TestMutationRequestFromArgsAddsNamedRuleset(t *testing.T) {
 }
 
 func TestMutationRequestFromArgsRemovesNamedRuleset(t *testing.T) {
-	req, _, err := mutationRequestFromArgs(adminapi.MutationRemove, []string{
+	req, _, _, err := mutationRequestFromArgs(adminapi.MutationRemove, []string{
 		"-target", "ruleset",
 		"-ruleset", "wireguard-up",
 	}, ioDiscard{})
@@ -188,7 +191,7 @@ func TestMutationRequestFromArgsValidatesWholeRulesetMutations(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := mutationRequestFromArgs(tt.op, tt.args, ioDiscard{})
+			_, _, _, err := mutationRequestFromArgs(tt.op, tt.args, ioDiscard{})
 			if err == nil {
 				t.Fatal("mutation request succeeded, expected error")
 			}
@@ -196,6 +199,50 @@ func TestMutationRequestFromArgsValidatesWholeRulesetMutations(t *testing.T) {
 				t.Fatalf("error = %q, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestMutationRequestFromArgsParsesJSONOut(t *testing.T) {
+	_, _, jsonOut, err := mutationRequestFromArgs(adminapi.MutationSet, []string{
+		"-target", "base_policy.enable_v4",
+		"true",
+		"--json-out",
+	}, ioDiscard{})
+	if err != nil {
+		t.Fatalf("mutation request: %v", err)
+	}
+	if !jsonOut {
+		t.Fatal("jsonOut = false, want true")
+	}
+}
+
+func TestPrintJSONLineIsCompactSingleLine(t *testing.T) {
+	var out bytes.Buffer
+	err := printJSONLine(&out, configUpdate{
+		EventType: adminapi.EventTypeConfig,
+		Config: adminapi.CurrentConfig{
+			InterfaceNames:  []string{"wg0"},
+			EffectivePolicy: adminapi.AllowRules{EnableV4: true},
+			AdminAPI:        adminapi.AdminConfig{SocketPath: "/tmp/killswitch.sock"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("print json line: %v", err)
+	}
+
+	got := out.String()
+	if strings.Count(got, "\n") != 1 || !strings.HasSuffix(got, "\n") {
+		t.Fatalf("output is not one JSON line: %q", got)
+	}
+	if strings.Contains(got, " ") {
+		t.Fatalf("output is not compact: %q", got)
+	}
+	var decoded configUpdate
+	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+		t.Fatalf("invalid JSON output: %v", err)
+	}
+	if decoded.EventType != adminapi.EventTypeConfig || len(decoded.Config.InterfaceNames) != 1 || decoded.Config.InterfaceNames[0] != "wg0" {
+		t.Fatalf("decoded output = %+v", decoded)
 	}
 }
 
