@@ -9,11 +9,14 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/asciimoth/killswitch/internal/adminapi"
+	"golang.org/x/sys/unix"
 )
 
 func main() {
@@ -40,6 +43,8 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 		return runMutation(adminapi.MutationRemove, args[1:], stdout, stderr)
 	case "set":
 		return runMutation(adminapi.MutationSet, args[1:], stdout, stderr)
+	case "tmp-ruleset":
+		return runTemporaryRuleset(args[1:], os.Stdin, stdout, stderr)
 	case "-h", "--help", "help":
 		return printUsage(stdout)
 	default:
@@ -47,6 +52,126 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return fmt.Errorf("unknown subcommand %q", args[0])
+	}
+}
+
+func runTemporaryRuleset(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("tmp-ruleset", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	jsonValue := flags.String("json", "", "temporary allow-rules JSON; prefix with @ to read a file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("tmp-ruleset expects no positional arguments, got: %s", strings.Join(flags.Args(), " "))
+	}
+	if *jsonValue == "" {
+		return errors.New("tmp-ruleset requires -json JSON or -json @FILE")
+	}
+	raw, err := readJSONArgument(*jsonValue)
+	if err != nil {
+		return err
+	}
+
+	client, err := adminapi.DialUnix(context.Background(), *socketPath)
+	if err != nil {
+		return err
+	}
+	defer client.Close() //nolint:errcheck
+
+	result, err := client.Mutate(adminapi.MutationRequest{
+		Operation: adminapi.MutationSet,
+		Target:    "tmp_ruleset",
+		Value:     raw,
+	})
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		return errors.New(result.Error)
+	}
+	if _, err := fmt.Fprintln(stdout, "temporary ruleset installed; press Ctrl+C, Ctrl+D, or Esc to remove it"); err != nil {
+		return err
+	}
+	restoreInput, err := rawInputMode(stdin)
+	if err != nil {
+		return err
+	}
+	defer restoreInput()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		for {
+			if _, err := client.Receive(); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+	}()
+
+	inputDone := make(chan error, 1)
+	go func() {
+		inputDone <- waitForStopInput(stdin)
+	}()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	select {
+	case err := <-serverDone:
+		if adminapi.IsEOF(err) {
+			return errors.New("server disconnected")
+		}
+		return fmt.Errorf("server disconnected: %w", err)
+	case err := <-inputDone:
+		return err
+	case <-signals:
+		return nil
+	}
+}
+
+func rawInputMode(r io.Reader) (func(), error) {
+	file, ok := r.(*os.File)
+	if !ok {
+		return func() {}, nil
+	}
+	fd := int(file.Fd())
+	termios, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err != nil {
+		if errors.Is(err, unix.ENOTTY) || errors.Is(err, unix.EINVAL) {
+			return func() {}, nil
+		}
+		return nil, fmt.Errorf("inspect terminal mode: %w", err)
+	}
+
+	raw := *termios
+	raw.Lflag &^= unix.ICANON | unix.ECHO
+	raw.Cc[unix.VMIN] = 1
+	raw.Cc[unix.VTIME] = 0
+	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &raw); err != nil {
+		return nil, fmt.Errorf("set raw terminal mode: %w", err)
+	}
+	return func() {
+		_ = unix.IoctlSetTermios(fd, unix.TCSETS, termios)
+	}, nil
+}
+
+func waitForStopInput(r io.Reader) error {
+	buf := make([]byte, 1)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 && (buf[0] == 0x03 || buf[0] == 0x04 || buf[0] == 0x1b) {
+			return nil
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
 	}
 }
 
@@ -178,7 +303,7 @@ func printUsage(w io.Writer) error {
 	if _, err := fmt.Fprintln(w, "Usage:"); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH]\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]")
+	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH]\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -json JSON|-json @FILE")
 	return err
 }
 
@@ -220,6 +345,15 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 			printer.printList("    trigger names", ruleset.Trigger.InterfaceNames)
 			printer.printList("    trigger regexps", ruleset.Trigger.InterfaceRegexps)
 			printer.printList("    trigger IPs", ruleset.Trigger.IPAddrs)
+			printer.printAllowRulesWithPrefix("    ", ruleset.Policy)
+		}
+	}
+
+	if len(cfg.TemporaryRulesets) > 0 {
+		printer.println()
+		printer.println("Temporary rulesets")
+		for i, ruleset := range cfg.TemporaryRulesets {
+			printer.printf("  #%d:\tclient=%s\n", i+1, ruleset.Client)
 			printer.printAllowRulesWithPrefix("    ", ruleset.Policy)
 		}
 	}

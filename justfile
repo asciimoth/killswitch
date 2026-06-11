@@ -19,5 +19,8 @@ get-cfg: build
 cli-add: build
   ./killswitch-cli add -target base_policy.allowed_ports tcp/443
 
+tmp-ruleset: build
+  ./killswitch-cli tmp-ruleset -json '{"enable_v4":true,"allowed_v4_hostports":["udp/198.51.100.10:51820"]}'
+
 test:
   go test ./... -count=1

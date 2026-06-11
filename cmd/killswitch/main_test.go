@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/asciimoth/killswitch/internal/adminapi"
@@ -403,6 +404,155 @@ func TestPolicyManagerSkipsUnchangedEffectiveRules(t *testing.T) {
 	}
 	if changed {
 		t.Fatal("expected unchanged effective policy to be skipped")
+	}
+}
+
+func TestPolicyManagerRecomputesActiveRulesetAndSkipsUnchangedEffectiveRules(t *testing.T) {
+	manager := &policyManager{
+		opts: options{
+			allowRules: allowRules{EnableV4: true},
+			Rulesets: []ruleset{
+				{
+					Name:       "home",
+					Priority:   10,
+					Trigger:    rulesetTrigger{InterfaceNames: []string{"eth0"}},
+					allowRules: allowRules{AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}},
+				},
+				{
+					Name:       "office",
+					Priority:   20,
+					Trigger:    rulesetTrigger{InterfaceNames: []string{"wg0"}},
+					allowRules: allowRules{AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}},
+				},
+			},
+		},
+		current:    canonicalAllowRules(allowRules{EnableV4: true, AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}}),
+		activeName: "home",
+		set:        true,
+	}
+
+	changed, err := manager.reconcile([]interfaceInfo{{Name: "wg0", Type: "wireguard"}}, true)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if changed {
+		t.Fatal("expected unchanged effective policy to be skipped")
+	}
+	if manager.activeName != "office" {
+		t.Fatalf("active ruleset = %q", manager.activeName)
+	}
+}
+
+func TestApplyAdminMutationRecomputesAndSkipsUnchangedEffectiveRules(t *testing.T) {
+	policies := &policyManager{
+		opts:    options{InterfaceNames: []string{"killswitch-test-no-such-interface"}, allowRules: allowRules{EnableV4: true}},
+		current: allowRules{EnableV4: true},
+		set:     true,
+	}
+	var reconcileMu sync.Mutex
+
+	result := applyAdminMutation(adminapi.MutationRequest{
+		Operation: adminapi.MutationSet,
+		Target:    "base_policy.enable_v4",
+		Value:     json.RawMessage(`true`),
+	}, policies, newEgressManager(nil), &reconcileMu)
+
+	if !result.OK {
+		t.Fatalf("mutation failed: %s", result.Error)
+	}
+	if result.Changed {
+		t.Fatal("expected unchanged effective policy to be skipped")
+	}
+	if !result.Config.EffectivePolicy.EnableV4 {
+		t.Fatalf("effective policy = %+v", result.Config.EffectivePolicy)
+	}
+}
+
+func TestPolicyManagerTemporaryRulesetMutationsSkipUnchangedEffectiveRules(t *testing.T) {
+	manager := &policyManager{
+		opts:    options{allowRules: allowRules{EnableV4: true}},
+		current: allowRules{EnableV4: true},
+		set:     true,
+	}
+
+	manager.setTemporaryRuleset("client", allowRules{EnableV4: true})
+	changed, err := manager.reconcile(nil, true)
+	if err != nil {
+		t.Fatalf("reconcile after tmp set: %v", err)
+	}
+	if changed {
+		t.Fatal("expected tmp set with unchanged effective policy to be skipped")
+	}
+
+	manager.setTemporaryRuleset("client", allowRules{EnableV4: true})
+	changed, err = manager.reconcile(nil, true)
+	if err != nil {
+		t.Fatalf("reconcile after tmp update: %v", err)
+	}
+	if changed {
+		t.Fatal("expected tmp update with unchanged effective policy to be skipped")
+	}
+
+	if !manager.removeTemporaryRuleset("client") {
+		t.Fatal("expected tmp ruleset to be removed")
+	}
+	changed, err = manager.reconcile(nil, true)
+	if err != nil {
+		t.Fatalf("reconcile after tmp remove: %v", err)
+	}
+	if changed {
+		t.Fatal("expected tmp remove with unchanged effective policy to be skipped")
+	}
+}
+
+func TestEffectiveAllowRulesMergesTemporaryRulesets(t *testing.T) {
+	active := &ruleset{
+		Name:       "office",
+		allowRules: allowRules{AllowedMarks: []uint32{0x42}},
+	}
+	effective := effectiveAllowRules(
+		allowRules{EnableV4: true, AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}},
+		active,
+		[]temporaryRuleset{
+			{Owner: "client-b", Rules: allowRules{EnableV6: true, AllowedV6Hosts: []ipv6AddrKey{ipv6Key(netipMustParse("2001:db8::10"))}}},
+			{Owner: "client-a", Rules: allowRules{AllowedV4Hosts: []uint32{ipv4Key(netipMustParse("192.0.2.10"))}}},
+		},
+	)
+
+	if !effective.EnableV4 || !effective.EnableV6 {
+		t.Fatalf("unexpected effective gates: %+v", effective)
+	}
+	if len(effective.AllowedMarks) != 1 || effective.AllowedMarks[0] != 0x42 {
+		t.Fatalf("allowed marks = %+v", effective.AllowedMarks)
+	}
+	if len(effective.AllowedPorts) != 1 || len(effective.AllowedV4Hosts) != 1 || len(effective.AllowedV6Hosts) != 1 {
+		t.Fatalf("allowlists were not merged: %+v", effective)
+	}
+}
+
+func TestPolicyManagerConfigSnapshotIncludesTemporaryRulesets(t *testing.T) {
+	manager := &policyManager{
+		opts:    options{allowRules: allowRules{EnableV4: true}},
+		current: allowRules{EnableV4: true, EnableV6: true},
+		tmpRulesets: map[string]allowRules{
+			"client-b": {EnableV6: true},
+			"client-a": {AllowedPorts: []portKey{{Dport: htons(53), Protocol: ipProtoUDP}}},
+		},
+		set: true,
+	}
+
+	cfg := manager.configSnapshot()
+	if !cfg.EffectivePolicy.EnableV6 {
+		t.Fatalf("effective policy = %+v", cfg.EffectivePolicy)
+	}
+	if len(cfg.TemporaryRulesets) != 2 {
+		t.Fatalf("tmp rulesets = %+v", cfg.TemporaryRulesets)
+	}
+	if cfg.TemporaryRulesets[0].Client != "client-a" || cfg.TemporaryRulesets[1].Client != "client-b" {
+		t.Fatalf("tmp rulesets are not sorted by owner: %+v", cfg.TemporaryRulesets)
+	}
+	if len(cfg.TemporaryRulesets[0].Policy.AllowedPorts) != 1 || !cfg.TemporaryRulesets[1].Policy.EnableV6 {
+		t.Fatalf("tmp ruleset policies = %+v", cfg.TemporaryRulesets)
 	}
 }
 

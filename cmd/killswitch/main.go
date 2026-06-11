@@ -204,12 +204,13 @@ type egressManager struct {
 }
 
 type policyManager struct {
-	mu         sync.Mutex
-	objs       *killswitchObjects
-	opts       options
-	current    allowRules
-	activeName string
-	set        bool
+	mu          sync.Mutex
+	objs        *killswitchObjects
+	opts        options
+	tmpRulesets map[string]allowRules
+	current     allowRules
+	activeName  string
+	set         bool
 }
 
 func main() {
@@ -440,6 +441,44 @@ func applyAdminMutation(req adminapi.MutationRequest, policies *policyManager, m
 	policies.replaceOptions(next)
 	if _, err := manager.reconcileCurrent(next, false); err != nil {
 		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
+	}
+	changed, err := policies.reconcileCurrent(true)
+	if err != nil {
+		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
+	}
+	return adminapi.MutationResult{OK: true, Changed: changed, Config: policies.configSnapshot()}
+}
+
+func applyTemporaryRulesetMutation(owner string, req adminapi.MutationRequest, policies *policyManager, _ *egressManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
+	reconcileMu.Lock()
+	defer reconcileMu.Unlock()
+
+	switch req.Operation {
+	case adminapi.MutationAdd, adminapi.MutationSet:
+		rules, err := allowRulesFromAPI(req.Policy, req.Value)
+		if err != nil {
+			return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
+		}
+		policies.setTemporaryRuleset(owner, rules)
+	case adminapi.MutationRemove:
+		policies.removeTemporaryRuleset(owner)
+	default:
+		return adminapi.MutationResult{OK: false, Error: fmt.Sprintf("unsupported mutation operation %q", req.Operation), Config: policies.configSnapshot()}
+	}
+
+	changed, err := policies.reconcileCurrent(true)
+	if err != nil {
+		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
+	}
+	return adminapi.MutationResult{OK: true, Changed: changed, Config: policies.configSnapshot()}
+}
+
+func removeTemporaryRuleset(owner string, policies *policyManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
+	reconcileMu.Lock()
+	defer reconcileMu.Unlock()
+
+	if !policies.removeTemporaryRuleset(owner) {
+		return adminapi.MutationResult{OK: true, Changed: false, Config: policies.configSnapshot()}
 	}
 	changed, err := policies.reconcileCurrent(true)
 	if err != nil {
@@ -900,6 +939,26 @@ func cloneAllowRules(rules allowRules) allowRules {
 	}
 }
 
+func cloneTemporaryRulesets(rulesets map[string]allowRules) []temporaryRuleset {
+	if len(rulesets) == 0 {
+		return nil
+	}
+	owners := make([]string, 0, len(rulesets))
+	for owner := range rulesets {
+		owners = append(owners, owner)
+	}
+	sort.Strings(owners)
+
+	out := make([]temporaryRuleset, 0, len(owners))
+	for _, owner := range owners {
+		out = append(out, temporaryRuleset{
+			Owner: owner,
+			Rules: cloneAllowRules(rulesets[owner]),
+		})
+	}
+	return out
+}
+
 func run(parent context.Context, opts options) error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("remove memlock rlimit: %w", err)
@@ -952,6 +1011,14 @@ func run(parent context.Context, opts options) error {
 	adminServer := newAdminAPIServer(opts.AdminAPI, policies.configSnapshot, func(req adminapi.MutationRequest) adminapi.MutationResult {
 		return applyAdminMutation(req, policies, manager, &reconcileMu)
 	})
+	adminServer.setTemporaryRulesetCallbacks(
+		func(owner string, req adminapi.MutationRequest) adminapi.MutationResult {
+			return applyTemporaryRulesetMutation(owner, req, policies, manager, &reconcileMu)
+		},
+		func(owner string) adminapi.MutationResult {
+			return removeTemporaryRuleset(owner, policies, &reconcileMu)
+		},
+	)
 	go func() {
 		if err := adminServer.listenAndServe(ctx); err != nil {
 			errCh <- err
@@ -1070,6 +1137,31 @@ func (m *policyManager) replaceOptions(opts options) {
 	m.opts = cloneOptions(opts)
 }
 
+func (m *policyManager) temporaryRulesetsSnapshot() []temporaryRuleset {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return cloneTemporaryRulesets(m.tmpRulesets)
+}
+
+func (m *policyManager) setTemporaryRuleset(owner string, rules allowRules) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.tmpRulesets == nil {
+		m.tmpRulesets = make(map[string]allowRules)
+	}
+	m.tmpRulesets[owner] = cloneAllowRules(rules)
+}
+
+func (m *policyManager) removeTemporaryRuleset(owner string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.tmpRulesets[owner]; !ok {
+		return false
+	}
+	delete(m.tmpRulesets, owner)
+	return true
+}
+
 func (m *policyManager) reconcileCurrent(logChange bool) (bool, error) {
 	all, err := listInterfaces()
 	if err != nil {
@@ -1080,14 +1172,13 @@ func (m *policyManager) reconcileCurrent(logChange bool) (bool, error) {
 
 func (m *policyManager) reconcile(all []interfaceInfo, logChange bool) (bool, error) {
 	opts := m.optionsSnapshot()
+	tmpRulesets := m.temporaryRulesetsSnapshot()
 	active := activeRuleset(all, opts.Rulesets)
-	effective := opts.allowRules
+	effective := effectiveAllowRules(opts.allowRules, active, tmpRulesets)
 	activeName := ""
 	if active != nil {
-		effective = mergeAllowRules(effective, active.allowRules)
 		activeName = active.Name
 	}
-	effective = canonicalAllowRules(effective)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1103,7 +1194,7 @@ func (m *policyManager) reconcile(all []interfaceInfo, logChange bool) (bool, er
 	m.activeName = activeName
 	m.set = true
 	if logChange {
-		logPolicy(activeName, effective)
+		logPolicy(activeName, len(tmpRulesets), effective)
 	}
 	return true, nil
 }
@@ -1114,6 +1205,7 @@ func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 	activeName := m.activeName
 	set := m.set
 	opts := cloneOptions(m.opts)
+	tmpRulesets := cloneTemporaryRulesets(m.tmpRulesets)
 	m.mu.Unlock()
 
 	if !set {
@@ -1130,10 +1222,27 @@ func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 		EffectivePolicy:         apiAllowRules(current),
 		ActiveRuleset:           activeName,
 		Rulesets:                apiRulesets(opts.Rulesets, activeName),
+		TemporaryRulesets:       apiTemporaryRulesets(tmpRulesets),
 		AdminAPI: adminapi.AdminConfig{
 			SocketPath: opts.AdminAPI.SocketPath,
 		},
 	}
+}
+
+type temporaryRuleset struct {
+	Owner string
+	Rules allowRules
+}
+
+func effectiveAllowRules(base allowRules, active *ruleset, tmpRulesets []temporaryRuleset) allowRules {
+	effective := base
+	if active != nil {
+		effective = mergeAllowRules(effective, active.allowRules)
+	}
+	for _, tmp := range tmpRulesets {
+		effective = mergeAllowRules(effective, tmp.Rules)
+	}
+	return canonicalAllowRules(effective)
 }
 
 func apiRulesets(rulesets []ruleset, activeName string) []adminapi.Ruleset {
@@ -1154,6 +1263,20 @@ func apiRulesets(rulesets []ruleset, activeName string) []adminapi.Ruleset {
 				IPAddrs:          apiAddrs(ruleset.Trigger.IPAddrs),
 			},
 			Policy: apiAllowRules(ruleset.allowRules),
+		})
+	}
+	return out
+}
+
+func apiTemporaryRulesets(rulesets []temporaryRuleset) []adminapi.TmpRuleset {
+	if len(rulesets) == 0 {
+		return nil
+	}
+	out := make([]adminapi.TmpRuleset, 0, len(rulesets))
+	for _, ruleset := range rulesets {
+		out = append(out, adminapi.TmpRuleset{
+			Client: ruleset.Owner,
+			Policy: apiAllowRules(ruleset.Rules),
 		})
 	}
 	return out
@@ -1500,7 +1623,7 @@ func allowRulesEqual(a, b allowRules) bool {
 	return reflect.DeepEqual(canonicalAllowRules(a), canonicalAllowRules(b))
 }
 
-func logPolicy(activeRuleset string, rules allowRules) {
+func logPolicy(activeRuleset string, temporaryRulesets int, rules allowRules) {
 	if rules.AllowAll {
 		log.Print("WARNING: AllowAll is enabled; protected interfaces will pass all traffic")
 	}
@@ -1509,6 +1632,7 @@ func logPolicy(activeRuleset string, rules allowRules) {
 	} else {
 		log.Printf("Active ruleset: %s", activeRuleset)
 	}
+	log.Printf("Temporary rulesets: %d", temporaryRulesets)
 	log.Printf("Runtime config: allow_all=%t enable_v4=%t enable_v6=%t", rules.AllowAll, rules.EnableV4, rules.EnableV6)
 	log.Printf("Allowlists: marks=%d ports=%d v4_hosts=%d v6_hosts=%d v4_hostports=%d v6_hostports=%d",
 		len(rules.AllowedMarks),

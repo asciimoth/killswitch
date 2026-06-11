@@ -13,6 +13,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,9 +51,12 @@ type adminAPIAuthRules struct {
 }
 
 type adminAPIServer struct {
-	opts           adminAPIOptions
-	configSnapshot func() adminapi.CurrentConfig
-	mutateConfig   func(adminapi.MutationRequest) adminapi.MutationResult
+	opts             adminAPIOptions
+	configSnapshot   func() adminapi.CurrentConfig
+	mutateConfig     func(adminapi.MutationRequest) adminapi.MutationResult
+	mutateTmpRuleset func(string, adminapi.MutationRequest) adminapi.MutationResult
+	removeTmpRuleset func(string) adminapi.MutationResult
+	nextConnectionID atomic.Uint64
 }
 
 type adminAPIPeer struct {
@@ -110,6 +114,11 @@ func newAdminAPIServer(opts adminAPIOptions, configSnapshot func() adminapi.Curr
 		}
 	}
 	return &adminAPIServer{opts: opts, configSnapshot: configSnapshot, mutateConfig: mutateConfig}
+}
+
+func (s *adminAPIServer) setTemporaryRulesetCallbacks(mutate func(string, adminapi.MutationRequest) adminapi.MutationResult, remove func(string) adminapi.MutationResult) {
+	s.mutateTmpRuleset = mutate
+	s.removeTmpRuleset = remove
 }
 
 func (s *adminAPIServer) listenAndServe(ctx context.Context) error {
@@ -245,6 +254,18 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 	}
 
 	log.Printf("Admin API connection authorized: pid=%d uid=%d gid=%d rule=%s", peer.PID, peer.UID, peer.GID, reason)
+	owner := s.clientOwner(peer)
+	defer func() {
+		if s.removeTmpRuleset == nil {
+			return
+		}
+		result := s.removeTmpRuleset(owner)
+		if !result.OK {
+			log.Printf("Admin API failed to remove temporary ruleset for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, result.Error)
+		} else if result.Changed {
+			log.Printf("Admin API removed temporary ruleset for pid=%d uid=%d gid=%d", peer.PID, peer.UID, peer.GID)
+		}
+	}()
 
 	decoder := json.NewDecoder(conn)
 	encoder := json.NewEncoder(conn)
@@ -265,7 +286,7 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 				return
 			}
 		case adminapi.MutationRequest:
-			result := s.mutateConfig(msg)
+			result := s.handleMutation(owner, msg)
 			if !result.OK {
 				log.Printf("Admin API rejected mutation for pid=%d uid=%d gid=%d op=%s target=%s ruleset=%s: %s", peer.PID, peer.UID, peer.GID, msg.Operation, msg.Target, msg.Ruleset, result.Error)
 			} else if result.Changed {
@@ -281,6 +302,21 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 			log.Printf("Admin API ignored unexpected client message %T for pid=%d uid=%d gid=%d", msg, peer.PID, peer.UID, peer.GID)
 		}
 	}
+}
+
+func (s *adminAPIServer) clientOwner(peer adminAPIPeer) string {
+	id := s.nextConnectionID.Add(1)
+	return fmt.Sprintf("pid=%d uid=%d gid=%d conn=%d", peer.PID, peer.UID, peer.GID, id)
+}
+
+func (s *adminAPIServer) handleMutation(owner string, req adminapi.MutationRequest) adminapi.MutationResult {
+	if req.Target == "tmp_ruleset" {
+		if s.mutateTmpRuleset == nil {
+			return adminapi.MutationResult{OK: false, Error: "temporary rulesets are not available", Config: s.configSnapshot()}
+		}
+		return s.mutateTmpRuleset(owner, req)
+	}
+	return s.mutateConfig(req)
 }
 
 func adminAPIPeerCred(conn *net.UnixConn) (adminAPIPeer, error) {

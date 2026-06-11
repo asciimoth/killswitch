@@ -83,17 +83,18 @@ func (m UnknownMessage) messageType() MessageType {
 }
 
 type CurrentConfig struct {
-	InterfaceTypes          []string    `json:"interface_types,omitempty"`
-	InterfaceNames          []string    `json:"interface_names,omitempty"`
-	InterfaceRegexps        []string    `json:"interface_regexps,omitempty"`
-	IgnoredInterfaceTypes   []string    `json:"ignored_interface_types,omitempty"`
-	IgnoredInterfaceNames   []string    `json:"ignored_interface_names,omitempty"`
-	IgnoredInterfaceRegexps []string    `json:"ignored_interface_regexps,omitempty"`
-	BasePolicy              AllowRules  `json:"base_policy"`
-	EffectivePolicy         AllowRules  `json:"effective_policy"`
-	ActiveRuleset           string      `json:"active_ruleset,omitempty"`
-	Rulesets                []Ruleset   `json:"rulesets,omitempty"`
-	AdminAPI                AdminConfig `json:"admin_api"`
+	InterfaceTypes          []string     `json:"interface_types,omitempty"`
+	InterfaceNames          []string     `json:"interface_names,omitempty"`
+	InterfaceRegexps        []string     `json:"interface_regexps,omitempty"`
+	IgnoredInterfaceTypes   []string     `json:"ignored_interface_types,omitempty"`
+	IgnoredInterfaceNames   []string     `json:"ignored_interface_names,omitempty"`
+	IgnoredInterfaceRegexps []string     `json:"ignored_interface_regexps,omitempty"`
+	BasePolicy              AllowRules   `json:"base_policy"`
+	EffectivePolicy         AllowRules   `json:"effective_policy"`
+	ActiveRuleset           string       `json:"active_ruleset,omitempty"`
+	Rulesets                []Ruleset    `json:"rulesets,omitempty"`
+	TemporaryRulesets       []TmpRuleset `json:"tmp_rulesets,omitempty"`
+	AdminAPI                AdminConfig  `json:"admin_api"`
 }
 
 type AdminConfig struct {
@@ -119,6 +120,11 @@ type Ruleset struct {
 	MatchAll bool           `json:"match_all"`
 	Trigger  RulesetTrigger `json:"trigger"`
 	Policy   AllowRules     `json:"policy"`
+}
+
+type TmpRuleset struct {
+	Client string     `json:"client"`
+	Policy AllowRules `json:"policy"`
 }
 
 type RulesetMutation struct {
