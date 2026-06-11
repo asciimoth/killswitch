@@ -1,5 +1,6 @@
 {
   "socket_path": "/run/killswitch/admin.sock",
   "notify_interface_changes": true,
-  "notify_global_allow_all": true
+  "notify_global_allow_all": true,
+  "tray_enabled": true
 }

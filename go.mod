@@ -6,6 +6,7 @@ tool github.com/cilium/ebpf/cmd/bpf2go
 
 require (
 	github.com/cilium/ebpf v0.21.0
+	github.com/energye/systray v1.0.3
 	github.com/esiqveland/notify v0.13.3
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/vishvananda/netlink v1.3.1

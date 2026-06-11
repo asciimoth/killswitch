@@ -114,6 +114,9 @@ func TestLoadOptionsCreatesDefaultConfig(t *testing.T) {
 	if cfg.NotifyGlobalAllowAll == nil || !*cfg.NotifyGlobalAllowAll {
 		t.Fatalf("default config notify_global_allow_all = %v", cfg.NotifyGlobalAllowAll)
 	}
+	if cfg.TrayEnabled == nil || !*cfg.TrayEnabled {
+		t.Fatalf("default config tray_enabled = %v", cfg.TrayEnabled)
+	}
 }
 
 func TestLoadOptionsRejectsGroupWritableConfig(t *testing.T) {
@@ -141,9 +144,9 @@ func TestLoadOptionsRejectsRelativeSocketPath(t *testing.T) {
 	}
 }
 
-func TestLoadOptionsReadsNotificationToggles(t *testing.T) {
+func TestLoadOptionsReadsUserIntegrationToggles(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "killswitch-user.json")
-	if err := os.WriteFile(configPath, []byte(`{"socket_path":"/tmp/admin.sock","notify_interface_changes":false,"notify_global_allow_all":false}`), 0o600); err != nil {
+	if err := os.WriteFile(configPath, []byte(`{"socket_path":"/tmp/admin.sock","notify_interface_changes":false,"notify_global_allow_all":false,"tray_enabled":false}`), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
@@ -156,6 +159,9 @@ func TestLoadOptionsReadsNotificationToggles(t *testing.T) {
 	}
 	if opts.NotifyGlobalAllowAll {
 		t.Fatal("notify global allow all enabled, want disabled")
+	}
+	if opts.TrayEnabled {
+		t.Fatal("tray enabled, want disabled")
 	}
 }
 
@@ -268,11 +274,17 @@ func TestConfigNotificationWatcherNotifiesOnlyInterfaceAppearGone(t *testing.T) 
 	notifications := &recordingNotifier{}
 	watcher := configNotificationWatcher{notifyInterfaceChanges: true, notifyGlobalAllowAll: true}
 	watcher.applyInitial(adminapi.CurrentConfig{
-		Interfaces: []adminapi.Interface{{Name: "eth0", Type: "device", Matched: true}},
+		Interfaces: []adminapi.Interface{
+			{Name: "eth0", Type: "device", Matched: true, Killswitch: true},
+			{Name: "lo", Type: "device"},
+		},
 	})
 
 	watcher.update(notifications, adminapi.CurrentConfig{
-		Interfaces: []adminapi.Interface{{Name: "eth0", Type: "device", Matched: false, Killswitch: true}},
+		Interfaces: []adminapi.Interface{
+			{Name: "eth0", Type: "device", Matched: false, Killswitch: true},
+			{Name: "lo", Type: "loopback", Matched: true},
+		},
 	})
 	if len(notifications.notifications) != 0 {
 		t.Fatalf("metadata-only notifications = %+v", notifications.notifications)
@@ -280,12 +292,16 @@ func TestConfigNotificationWatcherNotifiesOnlyInterfaceAppearGone(t *testing.T) 
 
 	watcher.update(notifications, adminapi.CurrentConfig{
 		Interfaces: []adminapi.Interface{
-			{Name: "eth0", Type: "device"},
-			{Name: "wg0", Type: "wireguard"},
+			{Name: "eth0", Type: "device", Killswitch: true},
+			{Name: "wg0", Type: "wireguard", Killswitch: true},
+			{Name: "wlan0", Type: "device"},
 		},
 	})
 	watcher.update(notifications, adminapi.CurrentConfig{
-		Interfaces: []adminapi.Interface{{Name: "wg0", Type: "wireguard"}},
+		Interfaces: []adminapi.Interface{
+			{Name: "wg0", Type: "wireguard", Killswitch: true},
+			{Name: "wlan0", Type: "device"},
+		},
 	})
 
 	if len(notifications.notifications) != 2 {
@@ -296,6 +312,42 @@ func TestConfigNotificationWatcherNotifiesOnlyInterfaceAppearGone(t *testing.T) 
 	}
 	if notifications.notifications[1].Header != "Interface disappeared" || notifications.notifications[1].Text != "eth0 (device)" {
 		t.Fatalf("disappeared notification = %+v", notifications.notifications[1])
+	}
+}
+
+func TestConfigNotificationWatcherUsesEffectiveInterfacesFromMutationResult(t *testing.T) {
+	notifications := &recordingNotifier{}
+	watcher := configNotificationWatcher{notifyInterfaceChanges: true}
+	watcher.applyInitial(adminapi.CurrentConfig{
+		Interfaces: []adminapi.Interface{
+			{Name: "eth0", Type: "device", Killswitch: true},
+			{Name: "lo", Type: "device"},
+		},
+		EffectiveInterfaces: []adminapi.InterfacePolicy{
+			{Name: "eth0", Type: "device", Attached: true},
+		},
+	})
+
+	watcher.update(notifications, adminapi.CurrentConfig{
+		BasePolicy: adminapi.AllowRules{AllowAll: true},
+		EffectiveInterfaces: []adminapi.InterfacePolicy{
+			{Name: "eth0", Type: "device", Attached: true},
+		},
+	})
+	watcher.update(notifications, adminapi.CurrentConfig{
+		BasePolicy: adminapi.AllowRules{AllowAll: true},
+		Interfaces: []adminapi.Interface{
+			{Name: "eth0", Type: "device", Killswitch: true},
+			{Name: "lo", Type: "device"},
+			{Name: "wlan0", Type: "device"},
+		},
+		EffectiveInterfaces: []adminapi.InterfacePolicy{
+			{Name: "eth0", Type: "device", Attached: true},
+		},
+	})
+
+	if len(notifications.notifications) != 0 {
+		t.Fatalf("notifications = %+v", notifications.notifications)
 	}
 }
 
@@ -333,6 +385,90 @@ func TestConfigNotificationWatcherGlobalAllowAll(t *testing.T) {
 	if notifications.closeGlobalAllowAllCount != 1 {
 		t.Fatalf("closed global allow all notifications = %d", notifications.closeGlobalAllowAllCount)
 	}
+}
+
+func TestTrayStateFromConfig(t *testing.T) {
+	cfg := adminapi.CurrentConfig{
+		BasePolicy: adminapi.AllowRules{AllowAll: true},
+		Interfaces: []adminapi.Interface{
+			{Name: "eth0", Killswitch: true},
+			{Name: "lo", Killswitch: false},
+		},
+		EffectiveInterfaces: []adminapi.InterfacePolicy{
+			{Name: "wg0", Attached: true, ForcedRulesets: []string{"vpn"}},
+			{Name: "eth0", Attached: true, ForcedRulesets: []string{"lan"}},
+			{Name: "wlan0", Attached: false},
+		},
+		Rulesets: []adminapi.Ruleset{
+			{Name: "vpn", Disabled: true},
+			{Name: "lan"},
+		},
+		ForceActiveRulesets: []adminapi.ForceRuleset{{Name: "lan", Interfaces: []string{"eth0"}}},
+	}
+
+	got := trayStateFromConfig(cfg)
+	want := trayState{
+		AllowAll: true,
+		Interfaces: []trayInterfaceState{
+			{
+				Name: "eth0",
+				Rulesets: []trayRulesetState{
+					{Name: "lan", Forced: true},
+					{Name: "vpn", Disabled: true},
+				},
+			},
+			{
+				Name: "wg0",
+				Rulesets: []trayRulesetState{
+					{Name: "lan"},
+					{Name: "vpn", Forced: true, Disabled: true},
+				},
+			},
+		},
+	}
+	if !trayStatesEqual(got, want) {
+		t.Fatalf("tray state = %+v, want %+v", got, want)
+	}
+}
+
+func TestTrayStateFallsBackToInterfaceKillswitchFlag(t *testing.T) {
+	got := trayStateFromConfig(adminapi.CurrentConfig{
+		Interfaces: []adminapi.Interface{
+			{Name: "wlan0", Killswitch: true},
+			{Name: "eth0", Killswitch: true},
+		},
+	})
+	want := []string{"eth0", "wlan0"}
+	if got := trayInterfaceNames(got.Interfaces); !reflect.DeepEqual(got, want) {
+		t.Fatalf("interfaces = %+v, want %+v", got, want)
+	}
+}
+
+func TestTrayStatesEqualDetectsDifferences(t *testing.T) {
+	base := trayState{
+		AllowAll: true,
+		Interfaces: []trayInterfaceState{
+			{Name: "eth0", Rulesets: []trayRulesetState{{Name: "vpn", Forced: true}}},
+		},
+	}
+	if !trayStatesEqual(base, base) {
+		t.Fatal("identical tray states are not equal")
+	}
+	changed := base
+	changed.Interfaces = []trayInterfaceState{
+		{Name: "eth0", Rulesets: []trayRulesetState{{Name: "vpn"}}},
+	}
+	if trayStatesEqual(base, changed) {
+		t.Fatal("different tray states are equal")
+	}
+}
+
+func trayInterfaceNames(interfaces []trayInterfaceState) []string {
+	out := make([]string, 0, len(interfaces))
+	for _, iface := range interfaces {
+		out = append(out, iface.Name)
+	}
+	return out
 }
 
 func TestNotificationTitle(t *testing.T) {
