@@ -20,7 +20,6 @@ import (
 
 	"github.com/asciimoth/killswitch/internal/adminapi"
 	dbusnotify "github.com/esiqveland/notify"
-	"github.com/gen2brain/beeep"
 	"github.com/godbus/dbus/v5"
 )
 
@@ -51,8 +50,8 @@ type notifier interface {
 
 type desktopNotifier struct {
 	mu                  sync.Mutex
-	allowAllNotifier    dbusnotify.Notifier
-	allowAllConn        *dbus.Conn
+	dbusNotifier        dbusnotify.Notifier
+	dbusConn            *dbus.Conn
 	allowAllID          uint32
 	allowAllDisableFunc func()
 }
@@ -454,7 +453,25 @@ func newDesktopNotifier() *desktopNotifier {
 }
 
 func (n *desktopNotifier) Notify(notification adminapi.Notification) error {
-	return beeep.Notify(notificationTitle(notification), notification.Text, "")
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.dbusNotifier == nil {
+		if err := n.openDBusNotifierLocked(); err != nil {
+			return err
+		}
+	}
+
+	note := dbusnotify.Notification{
+		AppName:       "Killswitch",
+		Summary:       notificationTitle(notification),
+		Body:          notification.Text,
+		ExpireTimeout: dbusnotify.ExpireTimeoutSetByNotificationServer,
+	}
+	note.SetUrgency(notificationUrgency(notification))
+
+	_, err := n.dbusNotifier.SendNotification(note)
+	return err
 }
 
 func (n *desktopNotifier) NotifyGlobalAllowAll(disable func()) error {
@@ -462,7 +479,7 @@ func (n *desktopNotifier) NotifyGlobalAllowAll(disable func()) error {
 	defer n.mu.Unlock()
 
 	n.allowAllDisableFunc = disable
-	if n.allowAllNotifier == nil {
+	if n.dbusNotifier == nil {
 		if err := n.openDBusNotifierLocked(); err != nil {
 			return err
 		}
@@ -480,7 +497,7 @@ func (n *desktopNotifier) NotifyGlobalAllowAll(disable func()) error {
 	}
 	note.SetUrgency(dbusnotify.UrgencyCritical)
 
-	id, err := n.allowAllNotifier.SendNotification(note)
+	id, err := n.dbusNotifier.SendNotification(note)
 	if err != nil {
 		return err
 	}
@@ -522,18 +539,18 @@ func (n *desktopNotifier) openDBusNotifierLocked() error {
 		return err
 	}
 
-	n.allowAllConn = conn
-	n.allowAllNotifier = notifier
+	n.dbusConn = conn
+	n.dbusNotifier = notifier
 	return nil
 }
 
 func (n *desktopNotifier) CloseGlobalAllowAll() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.allowAllNotifier == nil || n.allowAllID == 0 {
+	if n.dbusNotifier == nil || n.allowAllID == 0 {
 		return nil
 	}
-	_, err := n.allowAllNotifier.CloseNotification(n.allowAllID)
+	_, err := n.dbusNotifier.CloseNotification(n.allowAllID)
 	n.allowAllID = 0
 	return err
 }
@@ -543,23 +560,23 @@ func (n *desktopNotifier) Close() error {
 	defer n.mu.Unlock()
 
 	var errs []error
-	if n.allowAllNotifier != nil {
+	if n.dbusNotifier != nil {
 		if n.allowAllID != 0 {
-			if _, err := n.allowAllNotifier.CloseNotification(n.allowAllID); err != nil {
+			if _, err := n.dbusNotifier.CloseNotification(n.allowAllID); err != nil {
 				errs = append(errs, err)
 			}
 			n.allowAllID = 0
 		}
-		if err := n.allowAllNotifier.Close(); err != nil {
+		if err := n.dbusNotifier.Close(); err != nil {
 			errs = append(errs, err)
 		}
-		n.allowAllNotifier = nil
+		n.dbusNotifier = nil
 	}
-	if n.allowAllConn != nil {
-		if err := n.allowAllConn.Close(); err != nil {
+	if n.dbusConn != nil {
+		if err := n.dbusConn.Close(); err != nil {
 			errs = append(errs, err)
 		}
-		n.allowAllConn = nil
+		n.dbusConn = nil
 	}
 	return errors.Join(errs...)
 }
@@ -575,5 +592,14 @@ func notificationTitle(notification adminapi.Notification) string {
 		return "Killswitch error"
 	default:
 		return "Killswitch"
+	}
+}
+
+func notificationUrgency(notification adminapi.Notification) dbusnotify.Urgency {
+	switch notification.Level {
+	case adminapi.NotificationLevelWarn, adminapi.NotificationLevelError:
+		return dbusnotify.UrgencyCritical
+	default:
+		return dbusnotify.UrgencyNormal
 	}
 }
