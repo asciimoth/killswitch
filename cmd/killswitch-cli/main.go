@@ -164,6 +164,7 @@ func runTemporaryRuleset(args []string, stdin io.Reader, stdout, stderr io.Write
 	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
 	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
 	jsonValue := flags.String("json", "", "temporary allow-rules JSON; prefix with @ to read a file")
+	interfaces := flags.String("interfaces", "", "comma-separated interface names this temporary ruleset affects")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -173,10 +174,14 @@ func runTemporaryRuleset(args []string, stdin io.Reader, stdout, stderr io.Write
 	if *jsonValue == "" {
 		return errors.New("tmp-ruleset requires -json JSON or -json @FILE")
 	}
+	if *interfaces == "" {
+		return errors.New("tmp-ruleset requires -interfaces NAME[,NAME...]")
+	}
 	raw, err := readJSONArgument(*jsonValue)
 	if err != nil {
 		return err
 	}
+	interfaceNames := parseCSV(*interfaces)
 
 	client, err := adminapi.DialUnix(context.Background(), *socketPath)
 	if err != nil {
@@ -185,9 +190,10 @@ func runTemporaryRuleset(args []string, stdin io.Reader, stdout, stderr io.Write
 	defer client.Close() //nolint:errcheck
 
 	result, err := client.Mutate(adminapi.MutationRequest{
-		Operation: adminapi.MutationSet,
-		Target:    "tmp_ruleset",
-		Value:     raw,
+		Operation:  adminapi.MutationSet,
+		Target:     "tmp_ruleset",
+		Interfaces: interfaceNames,
+		Value:      raw,
 	})
 	if err != nil {
 		return err
@@ -195,7 +201,7 @@ func runTemporaryRuleset(args []string, stdin io.Reader, stdout, stderr io.Write
 	if !result.OK {
 		return errors.New(result.Error)
 	}
-	if _, err := fmt.Fprintln(stdout, "temporary ruleset installed; press Ctrl+C, Ctrl+D, or Esc to remove it"); err != nil {
+	if _, err := fmt.Fprintf(stdout, "temporary ruleset installed for %s; press Ctrl+C, Ctrl+D, or Esc to remove it\n", strings.Join(interfaceNames, ", ")); err != nil {
 		return err
 	}
 	restoreInput, err := rawInputMode(stdin)
@@ -243,6 +249,7 @@ func runForceRuleset(args []string, stdin io.Reader, stdout, stderr io.Writer) e
 	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
 	ruleset := flags.String("ruleset", "", "ruleset name to force activate")
 	flags.StringVar(ruleset, "r", "", "ruleset name to force activate")
+	interfaces := flags.String("interfaces", "", "comma-separated interface names this forced ruleset affects")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -252,6 +259,10 @@ func runForceRuleset(args []string, stdin io.Reader, stdout, stderr io.Writer) e
 	if *ruleset == "" {
 		return errors.New("force-ruleset requires -ruleset NAME")
 	}
+	if *interfaces == "" {
+		return errors.New("force-ruleset requires -interfaces NAME[,NAME...]")
+	}
+	interfaceNames := parseCSV(*interfaces)
 
 	client, err := adminapi.DialUnix(context.Background(), *socketPath)
 	if err != nil {
@@ -260,9 +271,10 @@ func runForceRuleset(args []string, stdin io.Reader, stdout, stderr io.Writer) e
 	defer client.Close() //nolint:errcheck
 
 	result, err := client.Mutate(adminapi.MutationRequest{
-		Operation: adminapi.MutationSet,
-		Target:    "force_ruleset",
-		Ruleset:   *ruleset,
+		Operation:  adminapi.MutationSet,
+		Target:     "force_ruleset",
+		Ruleset:    *ruleset,
+		Interfaces: interfaceNames,
 	})
 	if err != nil {
 		return err
@@ -270,7 +282,7 @@ func runForceRuleset(args []string, stdin io.Reader, stdout, stderr io.Writer) e
 	if !result.OK {
 		return errors.New(result.Error)
 	}
-	if _, err := fmt.Fprintf(stdout, "ruleset %q force activated; press Ctrl+C, Ctrl+D, or Esc to release it\n", *ruleset); err != nil {
+	if _, err := fmt.Fprintf(stdout, "ruleset %q force activated for %s; press Ctrl+C, Ctrl+D, or Esc to release it\n", *ruleset, strings.Join(interfaceNames, ", ")); err != nil {
 		return err
 	}
 	restoreInput, err := rawInputMode(stdin)
@@ -461,10 +473,25 @@ func readJSONArgument(value string) (json.RawMessage, error) {
 	return json.RawMessage(value), nil
 }
 
+func parseCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || seen[part] {
+			continue
+		}
+		seen[part] = true
+		out = append(out, part)
+	}
+	return out
+}
+
 func scalarTarget(target string) bool {
 	switch target {
 	case "base_policy.allow_all", "base_policy.enable_v4", "base_policy.enable_v6",
-		"ruleset.disabled", "ruleset.match_all", "ruleset.priority":
+		"ruleset.disabled", "ruleset.match_all":
 		return true
 	default:
 		return false
@@ -567,7 +594,7 @@ func printUsage(w io.Writer) error {
 	if _, err := fmt.Fprintln(w, "Usage:"); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch]\n  killswitch-cli notifications [-socket PATH]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target ruleset -ruleset NAME\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -json JSON|-json @FILE\n  killswitch-cli force-ruleset [-socket PATH] -ruleset NAME")
+	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch]\n  killswitch-cli notifications [-socket PATH]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE...\n  killswitch-cli remove [-socket PATH] -target ruleset -ruleset NAME\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE]\n  killswitch-cli tmp-ruleset [-socket PATH] -interfaces NAME[,NAME...] -json JSON|-json @FILE\n  killswitch-cli force-ruleset [-socket PATH] -interfaces NAME[,NAME...] -ruleset NAME")
 	return err
 }
 
@@ -611,18 +638,28 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 	printer.println()
 
 	printer.println("Effective policy")
-	if cfg.ActiveRuleset == "" {
-		printer.println("  active ruleset:\tnone")
+	if len(cfg.EffectiveInterfaces) > 0 {
+		for _, iface := range cfg.EffectiveInterfaces {
+			printer.printf("  %s:\tindex=%d type=%s attached=%t matched=%t\n", iface.Name, iface.Index, iface.Type, iface.Attached, iface.Matched)
+			printer.printList("    active rulesets", iface.ActiveRulesets)
+			printer.printList("    forced rulesets", iface.ForcedRulesets)
+			printer.printList("    temporary rulesets", iface.TemporaryRulesets)
+			printer.printAllowRulesWithPrefix("    ", iface.EffectivePolicy)
+		}
 	} else {
-		printer.printf("  active ruleset:\t%s\n", cfg.ActiveRuleset)
+		if cfg.ActiveRuleset == "" {
+			printer.println("  active ruleset:\tnone")
+		} else {
+			printer.printf("  active ruleset:\t%s\n", cfg.ActiveRuleset)
+		}
+		printer.printAllowRules(cfg.EffectivePolicy)
 	}
-	printer.printAllowRules(cfg.EffectivePolicy)
 
 	if len(cfg.Rulesets) > 0 {
 		printer.println()
 		printer.println("Rulesets")
 		for _, ruleset := range cfg.Rulesets {
-			printer.printf("  %s:\tactive=%t disabled=%t priority=%d match_all=%t\n", ruleset.Name, ruleset.Active, ruleset.Disabled, ruleset.Priority, ruleset.MatchAll)
+			printer.printf("  %s:\tactive=%t disabled=%t match_all=%t\n", ruleset.Name, ruleset.Active, ruleset.Disabled, ruleset.MatchAll)
 			printer.printList("    trigger types", ruleset.Trigger.InterfaceTypes)
 			printer.printList("    trigger names", ruleset.Trigger.InterfaceNames)
 			printer.printList("    trigger regexps", ruleset.Trigger.InterfaceRegexps)
@@ -636,6 +673,7 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 		printer.println("Temporary rulesets")
 		for i, ruleset := range cfg.TemporaryRulesets {
 			printer.printf("  #%d:\tclient=%s\n", i+1, ruleset.Client)
+			printer.printList("    interfaces", ruleset.Interfaces)
 			printer.printAllowRulesWithPrefix("    ", ruleset.Policy)
 		}
 	}
@@ -645,6 +683,7 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 		printer.println("Force-active rulesets")
 		for _, ruleset := range cfg.ForceActiveRulesets {
 			printer.printf("  %s:\tclients=%s\n", ruleset.Name, strings.Join(ruleset.Clients, ", "))
+			printer.printList("    interfaces", ruleset.Interfaces)
 		}
 	}
 

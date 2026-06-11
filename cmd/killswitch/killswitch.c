@@ -98,10 +98,6 @@ struct icmp6hdr {
     __sum16 icmp6_cksum;
 };
 
-// runtime_config is a singleton map value at key 0.
-//
-// Defaults are intentionally fail-closed: userspace writes zero values unless
-// the operator explicitly enables AllowAll or an IP version gate.
 struct runtime_config {
     __u8 allow_all;
     __u8 enable_v4;
@@ -110,16 +106,29 @@ struct runtime_config {
 };
 
 struct port_key {
+    __u32 ifindex;
     __be16 dport;
     __u8 protocol;
     __u8 reserved0;
 };
 
 struct ipv6_addr_key {
+    __u32 ifindex;
     __u8 addr[16];
 };
 
+struct mark_key {
+    __u32 ifindex;
+    __u32 mark;
+};
+
+struct v4_host_key {
+    __u32 ifindex;
+    __be32 daddr;
+};
+
 struct hostport4_key {
+    __u32 ifindex;
     __be32 daddr;
     __be16 dport;
     __u16 reserved0;
@@ -128,6 +137,7 @@ struct hostport4_key {
 };
 
 struct hostport6_key {
+    __u32 ifindex;
     __u8 daddr[16];
     __be16 dport;
     __u16 reserved0;
@@ -157,13 +167,13 @@ struct bootstrap_event {
     __u16 reserved0;
 };
 
-// Runtime policy flags. BPF_MAP_TYPE_ARRAY gives a stable singleton value that
-// userspace can update atomically by replacing key 0.
+// Runtime policy flags are keyed by ifindex. Missing entries fail closed for
+// routable traffic while bootstrap allowances remain independent of policy.
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u32);
     __type(value, struct runtime_config);
-    __uint(max_entries, 1);
+    __uint(max_entries, 4096);
 } runtime_config SEC(".maps");
 
 // Low-volume debug channel for packets that pass because of built-in bootstrap
@@ -176,44 +186,44 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, __u32);
+    __type(key, struct mark_key);
     __type(value, __u8);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 4096);
 } allowed_marks SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct port_key);
     __type(value, __u8);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 4096);
 } allowed_ports SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __type(key, __be32);
+    __type(key, struct v4_host_key);
     __type(value, __u8);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 4096);
 } allowed_v4_hosts SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct ipv6_addr_key);
     __type(value, __u8);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 4096);
 } allowed_v6_hosts SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct hostport4_key);
     __type(value, __u8);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 4096);
 } allowed_v4_hostports SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct hostport6_key);
     __type(value, __u8);
-    __uint(max_entries, 1024);
+    __uint(max_entries, 4096);
 } allowed_v6_hostports SEC(".maps");
 
 // data_available is the verifier-friendly bounds check used before every packet
@@ -295,13 +305,17 @@ static __always_inline int is_icmpv6_nd(struct icmp6hdr *icmp6) {
 }
 
 static __always_inline int mark_allowed(struct __sk_buff *skb) {
-    __u32 mark = skb->mark;
+    struct mark_key key = {
+        .ifindex = skb->ifindex,
+        .mark = skb->mark,
+    };
 
-    return bpf_map_lookup_elem(&allowed_marks, &mark) != 0;
+    return bpf_map_lookup_elem(&allowed_marks, &key) != 0;
 }
 
-static __always_inline int port_allowed(__u8 protocol, __be16 dport) {
+static __always_inline int port_allowed(struct __sk_buff *skb, __u8 protocol, __be16 dport) {
     struct port_key key = {
+        .ifindex = skb->ifindex,
         .dport = dport,
         .protocol = protocol,
     };
@@ -309,19 +323,27 @@ static __always_inline int port_allowed(__u8 protocol, __be16 dport) {
     return bpf_map_lookup_elem(&allowed_ports, &key) != 0;
 }
 
-static __always_inline int v4_host_allowed(__be32 daddr) {
-    return bpf_map_lookup_elem(&allowed_v4_hosts, &daddr) != 0;
+static __always_inline int v4_host_allowed(struct __sk_buff *skb, __be32 daddr) {
+    struct v4_host_key key = {
+        .ifindex = skb->ifindex,
+        .daddr = daddr,
+    };
+
+    return bpf_map_lookup_elem(&allowed_v4_hosts, &key) != 0;
 }
 
-static __always_inline int v6_host_allowed(const __u8 daddr[16]) {
-    struct ipv6_addr_key key = {};
+static __always_inline int v6_host_allowed(struct __sk_buff *skb, const __u8 daddr[16]) {
+    struct ipv6_addr_key key = {
+        .ifindex = skb->ifindex,
+    };
 
     copy_ipv6_addr(key.addr, daddr);
     return bpf_map_lookup_elem(&allowed_v6_hosts, &key) != 0;
 }
 
-static __always_inline int v4_hostport_allowed(__be32 daddr, __u8 protocol, __be16 dport) {
+static __always_inline int v4_hostport_allowed(struct __sk_buff *skb, __be32 daddr, __u8 protocol, __be16 dport) {
     struct hostport4_key key = {
+        .ifindex = skb->ifindex,
         .daddr = daddr,
         .dport = dport,
         .protocol = protocol,
@@ -330,8 +352,9 @@ static __always_inline int v4_hostport_allowed(__be32 daddr, __u8 protocol, __be
     return bpf_map_lookup_elem(&allowed_v4_hostports, &key) != 0;
 }
 
-static __always_inline int v6_hostport_allowed(const __u8 daddr[16], __u8 protocol, __be16 dport) {
+static __always_inline int v6_hostport_allowed(struct __sk_buff *skb, const __u8 daddr[16], __u8 protocol, __be16 dport) {
     struct hostport6_key key = {
+        .ifindex = skb->ifindex,
         .dport = dport,
         .protocol = protocol,
     };
@@ -351,7 +374,7 @@ static __always_inline int v6_hostport_allowed(const __u8 daddr[16], __u8 protoc
 //  6. Everything else drops by default.
 SEC("tc")
 int killswitch_egress(struct __sk_buff *skb) {
-    __u32 key = 0;
+    __u32 key = skb->ifindex;
     struct runtime_config *config;
     // skb->data and skb->data_end are packet-relative pointers supplied by the
     // tc hook. Cast through long as required for eBPF pointer extraction.
@@ -450,13 +473,13 @@ int killswitch_egress(struct __sk_buff *skb) {
         if (mark_allowed(skb)) {
             return TC_ACT_OK;
         }
-        if (has_ports && port_allowed(ip->protocol, dport)) {
+        if (has_ports && port_allowed(skb, ip->protocol, dport)) {
             return TC_ACT_OK;
         }
-        if (v4_host_allowed(ip->daddr)) {
+        if (v4_host_allowed(skb, ip->daddr)) {
             return TC_ACT_OK;
         }
-        if (has_ports && v4_hostport_allowed(ip->daddr, ip->protocol, dport)) {
+        if (has_ports && v4_hostport_allowed(skb, ip->daddr, ip->protocol, dport)) {
             return TC_ACT_OK;
         }
 
@@ -522,13 +545,13 @@ int killswitch_egress(struct __sk_buff *skb) {
         if (mark_allowed(skb)) {
             return TC_ACT_OK;
         }
-        if (has_ports && port_allowed(ip6->nexthdr, dport)) {
+        if (has_ports && port_allowed(skb, ip6->nexthdr, dport)) {
             return TC_ACT_OK;
         }
-        if (v6_host_allowed(ip6->daddr)) {
+        if (v6_host_allowed(skb, ip6->daddr)) {
             return TC_ACT_OK;
         }
-        if (has_ports && v6_hostport_allowed(ip6->daddr, ip6->nexthdr, dport)) {
+        if (has_ports && v6_hostport_allowed(skb, ip6->daddr, ip6->nexthdr, dport)) {
             return TC_ACT_OK;
         }
 

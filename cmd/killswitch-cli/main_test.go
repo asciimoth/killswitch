@@ -24,6 +24,19 @@ func TestPrintConfigIncludesTemporaryRulesets(t *testing.T) {
 				Killswitch: true,
 			},
 		},
+		EffectiveInterfaces: []adminapi.InterfacePolicy{
+			{
+				Index:             7,
+				Name:              "wg0",
+				Type:              "wireguard",
+				Matched:           true,
+				Attached:          true,
+				EffectivePolicy:   adminapi.AllowRules{EnableV4: true, EnableV6: true},
+				ActiveRulesets:    []string{"office"},
+				ForcedRulesets:    []string{"office"},
+				TemporaryRulesets: []string{"pid=100 uid=1000 gid=1000 conn=1"},
+			},
+		},
 		TemporaryRulesets: []adminapi.TmpRuleset{
 			{
 				Client: "pid=100 uid=1000 gid=1000 conn=1",
@@ -43,7 +56,6 @@ func TestPrintConfigIncludesTemporaryRulesets(t *testing.T) {
 			{
 				Name:     "office",
 				Disabled: true,
-				Priority: 20,
 				Trigger:  adminapi.RulesetTrigger{InterfaceNames: []string{"wg0"}},
 				Policy:   adminapi.AllowRules{EnableV4: true},
 			},
@@ -77,6 +89,10 @@ func TestPrintConfigIncludesTemporaryRulesets(t *testing.T) {
 		"disabled=true",
 		"wg0:",
 		"matched=true",
+		"attached=true",
+		"active rulesets:",
+		"forced rulesets:",
+		"temporary rulesets:",
 		"killswitch=true",
 		"Clients",
 		"events:",
@@ -98,7 +114,7 @@ func TestWaitForStopInputStopsOnEscapeAndEOF(t *testing.T) {
 }
 
 func TestMutationRequestFromArgsAddsNamedRuleset(t *testing.T) {
-	raw := `{"priority":100,"trigger":{"interface_names":["wg0"]},"policy":{"enable_v4":true}}`
+	raw := `{"trigger":{"interface_names":["wg0"]},"policy":{"enable_v4":true}}`
 	req, socketPath, err := mutationRequestFromArgs(adminapi.MutationAdd, []string{
 		"-socket", "/tmp/killswitch-test.sock",
 		"-target", "ruleset",

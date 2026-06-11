@@ -31,7 +31,6 @@
   "rulesets": {
     "wireguard-up": {
       "disabled": false,
-      "priority": 100,
       "match": "and",
       "trigger": {
         "interface_names": [

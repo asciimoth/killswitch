@@ -15,6 +15,7 @@ import (
 
 type killswitchHostport4Key struct {
 	_         structs.HostLayout
+	Ifindex   uint32
 	Daddr     uint32
 	Dport     uint16
 	Reserved0 uint16
@@ -24,6 +25,7 @@ type killswitchHostport4Key struct {
 
 type killswitchHostport6Key struct {
 	_         structs.HostLayout
+	Ifindex   uint32
 	Daddr     [16]uint8
 	Dport     uint16
 	Reserved0 uint16
@@ -32,12 +34,20 @@ type killswitchHostport6Key struct {
 }
 
 type killswitchIpv6AddrKey struct {
-	_    structs.HostLayout
-	Addr [16]uint8
+	_       structs.HostLayout
+	Ifindex uint32
+	Addr    [16]uint8
+}
+
+type killswitchMarkKey struct {
+	_       structs.HostLayout
+	Ifindex uint32
+	Mark    uint32
 }
 
 type killswitchPortKey struct {
 	_         structs.HostLayout
+	Ifindex   uint32
 	Dport     uint16
 	Protocol  uint8
 	Reserved0 uint8
@@ -49,6 +59,12 @@ type killswitchRuntimeConfig struct {
 	EnableV4  uint8
 	EnableV6  uint8
 	Reserved0 uint8
+}
+
+type killswitchV4HostKey struct {
+	_       structs.HostLayout
+	Ifindex uint32
+	Daddr   uint32
 }
 
 // loadKillswitch returns the embedded CollectionSpec for killswitch.

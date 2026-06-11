@@ -337,7 +337,7 @@ func (s *adminAPIServer) handleConnection(conn *net.UnixConn) {
 				log.Printf("Admin API write mutation result for pid=%d uid=%d gid=%d: %s", peer.PID, peer.UID, peer.GID, err)
 				return
 			}
-			if result.OK {
+			if result.OK && result.Changed {
 				s.notify(adminapi.EventTypeConfig)
 			}
 		case adminapi.DebugNotifyRequest:

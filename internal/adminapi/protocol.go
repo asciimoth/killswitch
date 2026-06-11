@@ -114,6 +114,7 @@ type MutationRequest struct {
 	Operation  MutationOperation `json:"operation"`
 	Target     string            `json:"target"`
 	Ruleset    string            `json:"ruleset,omitempty"`
+	Interfaces []string          `json:"interfaces,omitempty"`
 	Value      json.RawMessage   `json:"value,omitempty"`
 	Values     []string          `json:"values,omitempty"`
 	Policy     *AllowRules       `json:"policy,omitempty"`
@@ -145,21 +146,22 @@ func (m UnknownMessage) messageType() MessageType {
 }
 
 type CurrentConfig struct {
-	InterfaceTypes          []string       `json:"interface_types,omitempty"`
-	InterfaceNames          []string       `json:"interface_names,omitempty"`
-	InterfaceRegexps        []string       `json:"interface_regexps,omitempty"`
-	IgnoredInterfaceTypes   []string       `json:"ignored_interface_types,omitempty"`
-	IgnoredInterfaceNames   []string       `json:"ignored_interface_names,omitempty"`
-	IgnoredInterfaceRegexps []string       `json:"ignored_interface_regexps,omitempty"`
-	Interfaces              []Interface    `json:"interfaces,omitempty"`
-	BasePolicy              AllowRules     `json:"base_policy"`
-	EffectivePolicy         AllowRules     `json:"effective_policy"`
-	ActiveRuleset           string         `json:"active_ruleset,omitempty"`
-	Rulesets                []Ruleset      `json:"rulesets,omitempty"`
-	ForceActiveRulesets     []ForceRuleset `json:"force_active_rulesets,omitempty"`
-	TemporaryRulesets       []TmpRuleset   `json:"tmp_rulesets,omitempty"`
-	Clients                 []ClientInfo   `json:"clients,omitempty"`
-	AdminAPI                AdminConfig    `json:"admin_api"`
+	InterfaceTypes          []string          `json:"interface_types,omitempty"`
+	InterfaceNames          []string          `json:"interface_names,omitempty"`
+	InterfaceRegexps        []string          `json:"interface_regexps,omitempty"`
+	IgnoredInterfaceTypes   []string          `json:"ignored_interface_types,omitempty"`
+	IgnoredInterfaceNames   []string          `json:"ignored_interface_names,omitempty"`
+	IgnoredInterfaceRegexps []string          `json:"ignored_interface_regexps,omitempty"`
+	Interfaces              []Interface       `json:"interfaces,omitempty"`
+	BasePolicy              AllowRules        `json:"base_policy"`
+	EffectivePolicy         AllowRules        `json:"effective_policy"`
+	ActiveRuleset           string            `json:"active_ruleset,omitempty"`
+	EffectiveInterfaces     []InterfacePolicy `json:"effective_interfaces,omitempty"`
+	Rulesets                []Ruleset         `json:"rulesets,omitempty"`
+	ForceActiveRulesets     []ForceRuleset    `json:"force_active_rulesets,omitempty"`
+	TemporaryRulesets       []TmpRuleset      `json:"tmp_rulesets,omitempty"`
+	Clients                 []ClientInfo      `json:"clients,omitempty"`
+	AdminAPI                AdminConfig       `json:"admin_api"`
 }
 
 type Interface struct {
@@ -169,6 +171,18 @@ type Interface struct {
 	Addrs      []string `json:"addrs,omitempty"`
 	Matched    bool     `json:"matched"`
 	Killswitch bool     `json:"killswitch"`
+}
+
+type InterfacePolicy struct {
+	Index             int        `json:"index"`
+	Name              string     `json:"name"`
+	Type              string     `json:"type"`
+	Matched           bool       `json:"matched"`
+	Attached          bool       `json:"attached"`
+	EffectivePolicy   AllowRules `json:"effective_policy"`
+	ActiveRulesets    []string   `json:"active_rulesets,omitempty"`
+	ForcedRulesets    []string   `json:"forced_rulesets,omitempty"`
+	TemporaryRulesets []string   `json:"tmp_rulesets,omitempty"`
 }
 
 type ClientInfo struct {
@@ -201,25 +215,25 @@ type Ruleset struct {
 	Name     string         `json:"name"`
 	Active   bool           `json:"active"`
 	Disabled bool           `json:"disabled"`
-	Priority int            `json:"priority"`
 	MatchAll bool           `json:"match_all"`
 	Trigger  RulesetTrigger `json:"trigger"`
 	Policy   AllowRules     `json:"policy"`
 }
 
 type TmpRuleset struct {
-	Client string     `json:"client"`
-	Policy AllowRules `json:"policy"`
+	Client     string     `json:"client"`
+	Interfaces []string   `json:"interfaces,omitempty"`
+	Policy     AllowRules `json:"policy"`
 }
 
 type ForceRuleset struct {
-	Name    string   `json:"name"`
-	Clients []string `json:"clients,omitempty"`
+	Name       string   `json:"name"`
+	Clients    []string `json:"clients,omitempty"`
+	Interfaces []string `json:"interfaces,omitempty"`
 }
 
 type RulesetMutation struct {
 	Disabled bool           `json:"disabled"`
-	Priority int            `json:"priority"`
 	MatchAll bool           `json:"match_all"`
 	Trigger  RulesetTrigger `json:"trigger"`
 	Policy   AllowRules     `json:"policy"`

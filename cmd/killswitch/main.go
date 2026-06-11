@@ -80,9 +80,31 @@ type portKey struct {
 	Reserved uint8
 }
 
-// ipv6AddrKey mirrors struct ipv6_addr_key in killswitch.c.
+type markPolicyKey struct {
+	Ifindex uint32
+	Mark    uint32
+}
+
+type portPolicyKey struct {
+	Ifindex  uint32
+	Dport    uint16
+	Protocol uint8
+	Reserved uint8
+}
+
+// ipv6AddrKey stores an unscoped IPv6 address in parsed allow-rule config.
 type ipv6AddrKey struct {
 	Addr [16]byte
+}
+
+type v4HostPolicyKey struct {
+	Ifindex uint32
+	Daddr   uint32
+}
+
+type v6HostPolicyKey struct {
+	Ifindex uint32
+	Addr    [16]byte
 }
 
 // hostport4Key mirrors struct hostport4_key in killswitch.c. Explicit padding
@@ -97,6 +119,24 @@ type hostport4Key struct {
 
 // hostport6Key mirrors struct hostport6_key in killswitch.c.
 type hostport6Key struct {
+	Daddr     [16]byte
+	Dport     uint16
+	Reserved0 uint16
+	Protocol  uint8
+	Reserved1 [3]byte
+}
+
+type hostport4PolicyKey struct {
+	Ifindex   uint32
+	Daddr     uint32
+	Dport     uint16
+	Reserved0 uint16
+	Protocol  uint8
+	Reserved1 [3]byte
+}
+
+type hostport6PolicyKey struct {
+	Ifindex   uint32
 	Daddr     [16]byte
 	Dport     uint16
 	Reserved0 uint16
@@ -131,7 +171,6 @@ type allowRules struct {
 type ruleset struct {
 	Name     string
 	Disabled bool
-	Priority int
 	MatchAll bool
 	Trigger  rulesetTrigger
 	allowRules
@@ -166,7 +205,6 @@ type configFile struct {
 
 type rulesetConfig struct {
 	Disabled       bool          `json:"disabled"`
-	Priority       int           `json:"priority"`
 	Match          string        `json:"match"`
 	MatchAll       bool          `json:"match_all"`
 	Trigger        triggerConfig `json:"trigger"`
@@ -210,11 +248,18 @@ type policyManager struct {
 	mu            sync.Mutex
 	objs          *killswitchObjects
 	opts          options
-	tmpRulesets   map[string]allowRules
-	forceRulesets map[string]map[string]int
-	current       allowRules
-	activeName    string
+	tmpRulesets   map[string]temporaryRuleset
+	forceRulesets map[string]map[string]map[string]int
+	current       map[int]interfacePolicy
 	set           bool
+}
+
+type interfacePolicy struct {
+	Info              interfaceInfo
+	Rules             allowRules
+	ActiveRulesets    []string
+	ForcedRulesets    []string
+	TemporaryRulesets []string
 }
 
 func main() {
@@ -362,7 +407,6 @@ func rulesetsFromConfig(configs map[string]rulesetConfig) ([]ruleset, error) {
 		rulesets = append(rulesets, ruleset{
 			Name:       name,
 			Disabled:   cfg.Disabled,
-			Priority:   cfg.Priority,
 			MatchAll:   matchAll,
 			Trigger:    trigger,
 			allowRules: rules,
@@ -447,14 +491,14 @@ func applyAdminMutation(req adminapi.MutationRequest, policies *policyManager, m
 	if _, err := manager.reconcileCurrent(next, false); err != nil {
 		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
 	}
-	changed, err := policies.reconcileCurrent(true)
+	changed, err := policies.reconcileAttached(manager, true)
 	if err != nil {
 		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
 	}
 	return adminapi.MutationResult{OK: true, Changed: changed, Config: policies.configSnapshot()}
 }
 
-func applyTemporaryRulesetMutation(owner string, req adminapi.MutationRequest, policies *policyManager, _ *egressManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
+func applyTemporaryRulesetMutation(owner string, req adminapi.MutationRequest, policies *policyManager, manager *egressManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
 	reconcileMu.Lock()
 	defer reconcileMu.Unlock()
 
@@ -464,74 +508,77 @@ func applyTemporaryRulesetMutation(owner string, req adminapi.MutationRequest, p
 		if err != nil {
 			return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
 		}
-		policies.setTemporaryRuleset(owner, rules)
+		if len(req.Interfaces) == 0 {
+			return adminapi.MutationResult{OK: false, Error: "tmp_ruleset requires at least one interface name", Config: policies.configSnapshot()}
+		}
+		policies.setTemporaryRuleset(owner, uniqueSortedStrings(req.Interfaces), rules)
 	case adminapi.MutationRemove:
 		policies.removeTemporaryRuleset(owner)
 	default:
 		return adminapi.MutationResult{OK: false, Error: fmt.Sprintf("unsupported mutation operation %q", req.Operation), Config: policies.configSnapshot()}
 	}
 
-	changed, err := policies.reconcileCurrent(true)
+	changed, err := policies.reconcileAttached(manager, true)
 	if err != nil {
 		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
 	}
 	return adminapi.MutationResult{OK: true, Changed: changed, Config: policies.configSnapshot()}
 }
 
-func applyForceRulesetMutation(owner string, req adminapi.MutationRequest, policies *policyManager, _ *egressManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
+func applyForceRulesetMutation(owner string, req adminapi.MutationRequest, policies *policyManager, manager *egressManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
 	reconcileMu.Lock()
 	defer reconcileMu.Unlock()
 
 	if req.Ruleset == "" {
 		return adminapi.MutationResult{OK: false, Error: "ruleset name is required", Config: policies.configSnapshot()}
 	}
-	stateChanged := false
 	switch req.Operation {
 	case adminapi.MutationAdd, adminapi.MutationSet:
-		if !policies.forceActivateRuleset(owner, req.Ruleset) {
+		if len(req.Interfaces) == 0 {
+			return adminapi.MutationResult{OK: false, Error: "force_ruleset requires at least one interface name", Config: policies.configSnapshot()}
+		}
+		if !policies.forceActivateRuleset(owner, req.Ruleset, uniqueSortedStrings(req.Interfaces), req.Operation == adminapi.MutationSet) {
 			return adminapi.MutationResult{OK: false, Error: fmt.Sprintf("ruleset %q does not exist", req.Ruleset), Config: policies.configSnapshot()}
 		}
-		stateChanged = true
 	case adminapi.MutationRemove:
-		stateChanged = policies.releaseForceRuleset(owner, req.Ruleset)
+		policies.releaseForceRuleset(owner, req.Ruleset, uniqueSortedStrings(req.Interfaces))
 	default:
 		return adminapi.MutationResult{OK: false, Error: fmt.Sprintf("unsupported mutation operation %q", req.Operation), Config: policies.configSnapshot()}
 	}
 
-	policyChanged, err := policies.reconcileCurrent(true)
+	policyChanged, err := policies.reconcileAttached(manager, true)
 	if err != nil {
 		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
 	}
-	return adminapi.MutationResult{OK: true, Changed: stateChanged || policyChanged, Config: policies.configSnapshot()}
+	return adminapi.MutationResult{OK: true, Changed: policyChanged, Config: policies.configSnapshot()}
 }
 
-func removeTemporaryRuleset(owner string, policies *policyManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
+func removeTemporaryRuleset(owner string, policies *policyManager, manager *egressManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
 	reconcileMu.Lock()
 	defer reconcileMu.Unlock()
 
 	if !policies.removeTemporaryRuleset(owner) {
 		return adminapi.MutationResult{OK: true, Changed: false, Config: policies.configSnapshot()}
 	}
-	changed, err := policies.reconcileCurrent(true)
+	changed, err := policies.reconcileAttached(manager, true)
 	if err != nil {
 		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
 	}
 	return adminapi.MutationResult{OK: true, Changed: changed, Config: policies.configSnapshot()}
 }
 
-func removeForceRulesets(owner string, policies *policyManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
+func removeForceRulesets(owner string, policies *policyManager, manager *egressManager, reconcileMu *sync.Mutex) adminapi.MutationResult {
 	reconcileMu.Lock()
 	defer reconcileMu.Unlock()
 
-	stateChanged := policies.removeForceRulesets(owner)
-	if !stateChanged {
+	if !policies.removeForceRulesets(owner) {
 		return adminapi.MutationResult{OK: true, Changed: false, Config: policies.configSnapshot()}
 	}
-	policyChanged, err := policies.reconcileCurrent(true)
+	policyChanged, err := policies.reconcileAttached(manager, true)
 	if err != nil {
 		return adminapi.MutationResult{OK: false, Error: err.Error(), Config: policies.configSnapshot()}
 	}
-	return adminapi.MutationResult{OK: true, Changed: stateChanged || policyChanged, Config: policies.configSnapshot()}
+	return adminapi.MutationResult{OK: true, Changed: policyChanged, Config: policies.configSnapshot()}
 }
 
 func mutateOptions(opts options, req adminapi.MutationRequest) (options, error) {
@@ -741,18 +788,6 @@ func mutateRulesetField(rulesets *[]ruleset, field string, req adminapi.Mutation
 		if err := mutateBool(&rs.Disabled, req); err != nil {
 			return err
 		}
-	case "priority":
-		if req.Operation != adminapi.MutationSet {
-			return errors.New("ruleset priority only supports set")
-		}
-		var priority int
-		if len(req.Value) == 0 {
-			return errors.New("ruleset priority value is required")
-		}
-		if err := json.Unmarshal(req.Value, &priority); err != nil {
-			return fmt.Errorf("decode ruleset priority: %w", err)
-		}
-		rs.Priority = priority
 	case "match_all":
 		if err := mutateBool(&rs.MatchAll, req); err != nil {
 			return err
@@ -865,7 +900,7 @@ func rulesetFromAPI(name string, rulesetPtr *adminapi.RulesetMutation, raw json.
 	if err != nil {
 		return ruleset{}, err
 	}
-	return ruleset{Name: name, Disabled: api.Disabled, Priority: api.Priority, MatchAll: api.MatchAll, Trigger: trigger, allowRules: rules}, nil
+	return ruleset{Name: name, Disabled: api.Disabled, MatchAll: api.MatchAll, Trigger: trigger, allowRules: rules}, nil
 }
 
 func validateRegexps(field string, values []string) error {
@@ -891,6 +926,21 @@ func uniqueStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return append([]string(nil), out...)
+}
+
+func uniqueSortedStrings(values []string) []string {
+	out := uniqueStrings(values)
+	sort.Strings(out)
+	return out
+}
+
+func stringInSlice(value string, values []string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
 }
 
 func removeStrings(values, remove []string) []string {
@@ -959,7 +1009,6 @@ func cloneOptions(opts options) options {
 		out.Rulesets[i] = ruleset{
 			Name:       rs.Name,
 			Disabled:   rs.Disabled,
-			Priority:   rs.Priority,
 			MatchAll:   rs.MatchAll,
 			Trigger:    cloneRulesetTrigger(rs.Trigger),
 			allowRules: cloneAllowRules(rs.allowRules),
@@ -991,7 +1040,7 @@ func cloneAllowRules(rules allowRules) allowRules {
 	}
 }
 
-func cloneTemporaryRulesets(rulesets map[string]allowRules) []temporaryRuleset {
+func cloneTemporaryRulesets(rulesets map[string]temporaryRuleset) []temporaryRuleset {
 	if len(rulesets) == 0 {
 		return nil
 	}
@@ -1003,15 +1052,17 @@ func cloneTemporaryRulesets(rulesets map[string]allowRules) []temporaryRuleset {
 
 	out := make([]temporaryRuleset, 0, len(owners))
 	for _, owner := range owners {
+		tmp := rulesets[owner]
 		out = append(out, temporaryRuleset{
-			Owner: owner,
-			Rules: cloneAllowRules(rulesets[owner]),
+			Owner:      owner,
+			Interfaces: cloneStrings(tmp.Interfaces),
+			Rules:      cloneAllowRules(tmp.Rules),
 		})
 	}
 	return out
 }
 
-func cloneForceRulesets(rulesets map[string]map[string]int) []forceRuleset {
+func cloneForceRulesets(rulesets map[string]map[string]map[string]int) []forceRuleset {
 	if len(rulesets) == 0 {
 		return nil
 	}
@@ -1025,14 +1076,28 @@ func cloneForceRulesets(rulesets map[string]map[string]int) []forceRuleset {
 
 	out := make([]forceRuleset, 0, len(names))
 	for _, name := range names {
-		owners := make([]string, 0, len(rulesets[name]))
-		for owner := range rulesets[name] {
+		ownerSet := make(map[string]bool)
+		ifaceSet := make(map[string]bool)
+		for owner, ifaces := range rulesets[name] {
+			ownerSet[owner] = true
+			for iface := range ifaces {
+				ifaceSet[iface] = true
+			}
+		}
+		owners := make([]string, 0, len(ownerSet))
+		for owner := range ownerSet {
 			owners = append(owners, owner)
 		}
 		sort.Strings(owners)
+		ifaces := make([]string, 0, len(ifaceSet))
+		for iface := range ifaceSet {
+			ifaces = append(ifaces, iface)
+		}
+		sort.Strings(ifaces)
 		out = append(out, forceRuleset{
-			Name:   name,
-			Owners: owners,
+			Name:       name,
+			Owners:     owners,
+			Interfaces: ifaces,
 		})
 	}
 	return out
@@ -1049,10 +1114,9 @@ func run(parent context.Context, opts options) error {
 	}
 	defer objs.Close() //nolint:errcheck
 
+	manager := newEgressManager(objs.KillswitchEgress)
+	defer manager.close()
 	policies := newPolicyManager(&objs, opts)
-	if _, err := policies.reconcileCurrent(true); err != nil {
-		return err
-	}
 
 	signalCtx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -1070,8 +1134,6 @@ func run(parent context.Context, opts options) error {
 		_ = reader.Close()
 	}()
 
-	manager := newEgressManager(objs.KillswitchEgress)
-	defer manager.close()
 	var reconcileMu sync.Mutex
 
 	var adminServer *adminAPIServer
@@ -1099,7 +1161,7 @@ func run(parent context.Context, opts options) error {
 			return applyTemporaryRulesetMutation(owner, req, policies, manager, &reconcileMu)
 		},
 		func(owner string) adminapi.MutationResult {
-			return removeTemporaryRuleset(owner, policies, &reconcileMu)
+			return removeTemporaryRuleset(owner, policies, manager, &reconcileMu)
 		},
 	)
 	adminServer.setForceRulesetCallbacks(
@@ -1107,7 +1169,7 @@ func run(parent context.Context, opts options) error {
 			return applyForceRulesetMutation(owner, req, policies, manager, &reconcileMu)
 		},
 		func(owner string) adminapi.MutationResult {
-			return removeForceRulesets(owner, policies, &reconcileMu)
+			return removeForceRulesets(owner, policies, manager, &reconcileMu)
 		},
 	)
 	go func() {
@@ -1248,13 +1310,13 @@ func (m *policyManager) forceRulesetsSnapshot() []forceRuleset {
 	return cloneForceRulesets(m.forceRulesets)
 }
 
-func (m *policyManager) setTemporaryRuleset(owner string, rules allowRules) {
+func (m *policyManager) setTemporaryRuleset(owner string, interfaces []string, rules allowRules) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.tmpRulesets == nil {
-		m.tmpRulesets = make(map[string]allowRules)
+		m.tmpRulesets = make(map[string]temporaryRuleset)
 	}
-	m.tmpRulesets[owner] = cloneAllowRules(rules)
+	m.tmpRulesets[owner] = temporaryRuleset{Owner: owner, Interfaces: cloneStrings(interfaces), Rules: cloneAllowRules(rules)}
 }
 
 func (m *policyManager) removeTemporaryRuleset(owner string) bool {
@@ -1267,28 +1329,36 @@ func (m *policyManager) removeTemporaryRuleset(owner string) bool {
 	return true
 }
 
-func (m *policyManager) forceActivateRuleset(owner, name string) bool {
+func (m *policyManager) forceActivateRuleset(owner, name string, interfaces []string, replace bool) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if findRuleset(m.opts.Rulesets, name) < 0 {
 		return false
 	}
 	if m.forceRulesets == nil {
-		m.forceRulesets = make(map[string]map[string]int)
+		m.forceRulesets = make(map[string]map[string]map[string]int)
 	}
 	owners := m.forceRulesets[name]
 	if owners == nil {
-		owners = make(map[string]int)
+		owners = make(map[string]map[string]int)
 		m.forceRulesets[name] = owners
 	}
-	owners[owner]++
+	if owners[owner] == nil {
+		owners[owner] = make(map[string]int)
+	}
+	if replace {
+		clear(owners[owner])
+	}
+	for _, iface := range interfaces {
+		owners[owner][iface]++
+	}
 	return true
 }
 
-func (m *policyManager) releaseForceRuleset(owner, name string) bool {
+func (m *policyManager) releaseForceRuleset(owner, name string, interfaces []string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.releaseForceRulesetLocked(owner, name)
+	return m.releaseForceRulesetLocked(owner, name, interfaces)
 }
 
 func (m *policyManager) removeForceRulesets(owner string) bool {
@@ -1303,15 +1373,24 @@ func (m *policyManager) removeForceRulesets(owner string) bool {
 	return changed
 }
 
-func (m *policyManager) releaseForceRulesetLocked(owner, name string) bool {
+func (m *policyManager) releaseForceRulesetLocked(owner, name string, interfaces []string) bool {
 	owners := m.forceRulesets[name]
-	if owners == nil || owners[owner] == 0 {
+	if owners == nil || len(owners[owner]) == 0 {
 		return false
 	}
-	if owners[owner] == 1 {
+	if len(interfaces) == 0 {
 		delete(owners, owner)
 	} else {
-		owners[owner]--
+		for _, iface := range interfaces {
+			if owners[owner][iface] <= 1 {
+				delete(owners[owner], iface)
+			} else {
+				owners[owner][iface]--
+			}
+		}
+		if len(owners[owner]) == 0 {
+			delete(owners, owner)
+		}
 	}
 	if len(owners) == 0 {
 		delete(m.forceRulesets, name)
@@ -1321,7 +1400,7 @@ func (m *policyManager) releaseForceRulesetLocked(owner, name string) bool {
 
 func (m *policyManager) releaseAllForceRulesetLocked(owner, name string) bool {
 	owners := m.forceRulesets[name]
-	if owners == nil || owners[owner] == 0 {
+	if owners == nil || len(owners[owner]) == 0 {
 		return false
 	}
 	delete(owners, owner)
@@ -1342,48 +1421,58 @@ func (m *policyManager) pruneForceRulesetsLocked() {
 	}
 }
 
-func (m *policyManager) reconcileCurrent(logChange bool) (bool, error) {
+func (m *policyManager) reconcileAttached(manager *egressManager, logChange bool) (bool, error) {
+	if manager == nil {
+		return m.reconcile(nil, logChange)
+	}
+	attached := manager.attachedIndexSnapshot()
+	if len(attached) == 0 {
+		return m.reconcile(nil, logChange)
+	}
 	all, err := listInterfaces()
 	if err != nil {
 		return false, fmt.Errorf("list interfaces: %w", err)
 	}
-	return m.reconcile(all, logChange)
+	current := make([]interfaceInfo, 0, len(attached))
+	for _, iface := range all {
+		if attached[iface.Index] {
+			current = append(current, iface)
+		}
+	}
+	return m.reconcile(current, logChange)
 }
 
 func (m *policyManager) reconcile(all []interfaceInfo, logChange bool) (bool, error) {
 	opts := m.optionsSnapshot()
 	tmpRulesets := m.temporaryRulesetsSnapshot()
 	forceRulesets := m.forceRulesetsSnapshot()
-	active := activeRuleset(all, opts.Rulesets)
-	effective := effectiveAllowRules(opts.allowRules, active, forcedRulesets(opts.Rulesets, forceRulesets), tmpRulesets)
-	activeName := ""
-	if active != nil {
-		activeName = active.Name
+	selected, err := selectInterfaces(all, opts)
+	if err != nil {
+		return false, err
 	}
+	next := effectivePoliciesForInterfaces(selected, opts, tmpRulesets, forceRulesets)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.set && allowRulesEqual(m.current, effective) {
-		m.activeName = activeName
+	if m.set && interfacePolicyRulesEqual(m.current, next) {
+		m.current = cloneInterfacePolicyMap(next)
 		return false, nil
 	}
 
-	if err := writeEffectivePolicy(m.objs, effective); err != nil {
+	if err := writeEffectivePolicies(m.objs, m.current, next); err != nil {
 		return false, err
 	}
-	m.current = effective
-	m.activeName = activeName
+	m.current = cloneInterfacePolicyMap(next)
 	m.set = true
 	if logChange {
-		logPolicy(activeName, len(tmpRulesets), effective)
+		logPolicies(next)
 	}
 	return true, nil
 }
 
 func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 	m.mu.Lock()
-	current := m.current
-	activeName := m.activeName
+	current := cloneInterfacePolicyMap(m.current)
 	set := m.set
 	opts := cloneOptions(m.opts)
 	tmpRulesets := cloneTemporaryRulesets(m.tmpRulesets)
@@ -1391,7 +1480,7 @@ func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 	m.mu.Unlock()
 
 	if !set {
-		current = opts.allowRules
+		current = nil
 	}
 	return adminapi.CurrentConfig{
 		InterfaceTypes:          cloneStrings(opts.InterfaceTypes),
@@ -1401,9 +1490,10 @@ func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 		IgnoredInterfaceNames:   cloneStrings(opts.IgnoredInterfaceNames),
 		IgnoredInterfaceRegexps: cloneStrings(opts.IgnoredInterfaceRegexps),
 		BasePolicy:              apiAllowRules(opts.allowRules),
-		EffectivePolicy:         apiAllowRules(current),
-		ActiveRuleset:           activeName,
-		Rulesets:                apiRulesets(opts.Rulesets, activeName),
+		EffectivePolicy:         apiAllowRules(firstEffectivePolicy(current, opts.allowRules)),
+		ActiveRuleset:           firstActiveRuleset(current),
+		EffectiveInterfaces:     apiInterfacePolicies(current),
+		Rulesets:                apiRulesets(opts.Rulesets, activeRulesetSet(current)),
 		ForceActiveRulesets:     apiForceRulesets(forceRulesets),
 		TemporaryRulesets:       apiTemporaryRulesets(tmpRulesets),
 		AdminAPI: adminapi.AdminConfig{
@@ -1432,19 +1522,21 @@ func currentConfigSnapshot(policies *policyManager, manager *egressManager, clie
 }
 
 type temporaryRuleset struct {
-	Owner string
-	Rules allowRules
+	Owner      string
+	Interfaces []string
+	Rules      allowRules
 }
 
 type forceRuleset struct {
-	Name   string
-	Owners []string
+	Name       string
+	Owners     []string
+	Interfaces []string
 }
 
-func effectiveAllowRules(base allowRules, active *ruleset, forceRulesets []ruleset, tmpRulesets []temporaryRuleset) allowRules {
+func effectiveAllowRules(base allowRules, active []ruleset, forceRulesets []ruleset, tmpRulesets []temporaryRuleset) allowRules {
 	effective := base
-	if active != nil {
-		effective = mergeAllowRules(effective, active.allowRules)
+	for _, ruleset := range active {
+		effective = mergeAllowRules(effective, ruleset.allowRules)
 	}
 	for _, ruleset := range forceRulesets {
 		effective = mergeAllowRules(effective, ruleset.allowRules)
@@ -1455,12 +1547,15 @@ func effectiveAllowRules(base allowRules, active *ruleset, forceRulesets []rules
 	return canonicalAllowRules(effective)
 }
 
-func forcedRulesets(rulesets []ruleset, forceRulesets []forceRuleset) []ruleset {
+func forcedRulesetsForInterface(rulesets []ruleset, forceRulesets []forceRuleset, ifaceName string) []ruleset {
 	if len(forceRulesets) == 0 {
 		return nil
 	}
 	out := make([]ruleset, 0, len(forceRulesets))
 	for _, forced := range forceRulesets {
+		if !stringInSlice(ifaceName, forced.Interfaces) {
+			continue
+		}
 		idx := findRuleset(rulesets, forced.Name)
 		if idx >= 0 {
 			out = append(out, rulesets[idx])
@@ -1469,7 +1564,68 @@ func forcedRulesets(rulesets []ruleset, forceRulesets []forceRuleset) []ruleset 
 	return out
 }
 
-func apiRulesets(rulesets []ruleset, activeName string) []adminapi.Ruleset {
+func temporaryRulesetsForInterface(rulesets []temporaryRuleset, ifaceName string) []temporaryRuleset {
+	out := make([]temporaryRuleset, 0, len(rulesets))
+	for _, ruleset := range rulesets {
+		if stringInSlice(ifaceName, ruleset.Interfaces) {
+			out = append(out, ruleset)
+		}
+	}
+	return out
+}
+
+func effectivePoliciesForInterfaces(ifaces []interfaceInfo, opts options, tmpRulesets []temporaryRuleset, forceRulesets []forceRuleset) map[int]interfacePolicy {
+	if len(ifaces) == 0 {
+		return nil
+	}
+	out := make(map[int]interfacePolicy, len(ifaces))
+	for _, iface := range ifaces {
+		active := activeRulesetsForInterface(iface, opts.Rulesets)
+		forced := forcedRulesetsForInterface(opts.Rulesets, forceRulesets, iface.Name)
+		tmp := temporaryRulesetsForInterface(tmpRulesets, iface.Name)
+		out[iface.Index] = interfacePolicy{
+			Info:              iface,
+			Rules:             effectiveAllowRules(opts.allowRules, active, forced, tmp),
+			ActiveRulesets:    rulesetNames(active),
+			ForcedRulesets:    rulesetNames(forced),
+			TemporaryRulesets: temporaryRulesetOwners(tmp),
+		}
+	}
+	return out
+}
+
+func activeRulesetsForInterface(iface interfaceInfo, rulesets []ruleset) []ruleset {
+	out := make([]ruleset, 0, len(rulesets))
+	for _, ruleset := range rulesets {
+		if ruleset.Disabled {
+			continue
+		}
+		if rulesetTriggerMatchesInterface(iface, ruleset.Trigger, ruleset.MatchAll) {
+			out = append(out, ruleset)
+		}
+	}
+	return out
+}
+
+func rulesetNames(rulesets []ruleset) []string {
+	out := make([]string, 0, len(rulesets))
+	for _, ruleset := range rulesets {
+		out = append(out, ruleset.Name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func temporaryRulesetOwners(rulesets []temporaryRuleset) []string {
+	out := make([]string, 0, len(rulesets))
+	for _, ruleset := range rulesets {
+		out = append(out, ruleset.Owner)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func apiRulesets(rulesets []ruleset, activeNames map[string]bool) []adminapi.Ruleset {
 	if len(rulesets) == 0 {
 		return nil
 	}
@@ -1477,9 +1633,8 @@ func apiRulesets(rulesets []ruleset, activeName string) []adminapi.Ruleset {
 	for _, ruleset := range rulesets {
 		out = append(out, adminapi.Ruleset{
 			Name:     ruleset.Name,
-			Active:   !ruleset.Disabled && ruleset.Name == activeName,
+			Active:   !ruleset.Disabled && activeNames[ruleset.Name],
 			Disabled: ruleset.Disabled,
-			Priority: ruleset.Priority,
 			MatchAll: ruleset.MatchAll,
 			Trigger: adminapi.RulesetTrigger{
 				InterfaceTypes:   cloneStrings(ruleset.Trigger.InterfaceTypes),
@@ -1500,8 +1655,9 @@ func apiTemporaryRulesets(rulesets []temporaryRuleset) []adminapi.TmpRuleset {
 	out := make([]adminapi.TmpRuleset, 0, len(rulesets))
 	for _, ruleset := range rulesets {
 		out = append(out, adminapi.TmpRuleset{
-			Client: ruleset.Owner,
-			Policy: apiAllowRules(ruleset.Rules),
+			Client:     ruleset.Owner,
+			Interfaces: cloneStrings(ruleset.Interfaces),
+			Policy:     apiAllowRules(ruleset.Rules),
 		})
 	}
 	return out
@@ -1514,9 +1670,69 @@ func apiForceRulesets(rulesets []forceRuleset) []adminapi.ForceRuleset {
 	out := make([]adminapi.ForceRuleset, 0, len(rulesets))
 	for _, ruleset := range rulesets {
 		out = append(out, adminapi.ForceRuleset{
-			Name:    ruleset.Name,
-			Clients: cloneStrings(ruleset.Owners),
+			Name:       ruleset.Name,
+			Clients:    cloneStrings(ruleset.Owners),
+			Interfaces: cloneStrings(ruleset.Interfaces),
 		})
+	}
+	return out
+}
+
+func apiInterfacePolicies(current map[int]interfacePolicy) []adminapi.InterfacePolicy {
+	if len(current) == 0 {
+		return nil
+	}
+	indexes := make([]int, 0, len(current))
+	for index := range current {
+		indexes = append(indexes, index)
+	}
+	sort.Slice(indexes, func(i, j int) bool {
+		a, b := current[indexes[i]].Info, current[indexes[j]].Info
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		return a.Index < b.Index
+	})
+	out := make([]adminapi.InterfacePolicy, 0, len(indexes))
+	for _, index := range indexes {
+		p := current[index]
+		out = append(out, adminapi.InterfacePolicy{
+			Index:             p.Info.Index,
+			Name:              p.Info.Name,
+			Type:              p.Info.Type,
+			Matched:           true,
+			Attached:          true,
+			EffectivePolicy:   apiAllowRules(p.Rules),
+			ActiveRulesets:    cloneStrings(p.ActiveRulesets),
+			ForcedRulesets:    cloneStrings(p.ForcedRulesets),
+			TemporaryRulesets: cloneStrings(p.TemporaryRulesets),
+		})
+	}
+	return out
+}
+
+func firstEffectivePolicy(current map[int]interfacePolicy, fallback allowRules) allowRules {
+	for _, policy := range current {
+		return policy.Rules
+	}
+	return fallback
+}
+
+func firstActiveRuleset(current map[int]interfacePolicy) string {
+	for _, policy := range current {
+		if len(policy.ActiveRulesets) > 0 {
+			return policy.ActiveRulesets[0]
+		}
+	}
+	return ""
+}
+
+func activeRulesetSet(current map[int]interfacePolicy) map[string]bool {
+	out := make(map[string]bool)
+	for _, policy := range current {
+		for _, name := range policy.ActiveRulesets {
+			out[name] = true
+		}
 	}
 	return out
 }
@@ -1649,24 +1865,7 @@ func cloneStrings(values []string) []string {
 	return append([]string(nil), values...)
 }
 
-func activeRuleset(all []interfaceInfo, rulesets []ruleset) *ruleset {
-	var active *ruleset
-	for i := range rulesets {
-		ruleset := &rulesets[i]
-		if ruleset.Disabled {
-			continue
-		}
-		if !rulesetTriggerMatches(all, ruleset.Trigger, ruleset.MatchAll) {
-			continue
-		}
-		if active == nil || ruleset.Priority > active.Priority || (ruleset.Priority == active.Priority && ruleset.Name < active.Name) {
-			active = ruleset
-		}
-	}
-	return active
-}
-
-func rulesetTriggerMatches(all []interfaceInfo, trigger rulesetTrigger, matchAll bool) bool {
+func rulesetTriggerMatchesInterface(iface interfaceInfo, trigger rulesetTrigger, matchAll bool) bool {
 	total := len(trigger.InterfaceTypes) + len(trigger.InterfaceNames) + len(trigger.InterfaceRegexps) + len(trigger.IPAddrs)
 	if total == 0 {
 		return false
@@ -1674,23 +1873,26 @@ func rulesetTriggerMatches(all []interfaceInfo, trigger rulesetTrigger, matchAll
 
 	matched := 0
 	for _, typ := range trigger.InterfaceTypes {
-		if systemHasInterfaceType(all, typ) {
+		if iface.Type == typ {
 			matched++
 		}
 	}
 	for _, name := range trigger.InterfaceNames {
-		if systemHasInterfaceName(all, name) {
+		if iface.Name == name {
 			matched++
 		}
 	}
 	for _, pattern := range trigger.InterfaceRegexps {
-		if systemHasInterfaceRegexp(all, pattern) {
+		if regexp.MustCompile(pattern).MatchString(iface.Name) {
 			matched++
 		}
 	}
 	for _, addr := range trigger.IPAddrs {
-		if systemHasIPAddr(all, addr) {
-			matched++
+		for _, ifaceAddr := range iface.Addrs {
+			if ifaceAddr.Unmap() == addr.Unmap() {
+				matched++
+				break
+			}
 		}
 	}
 	if matchAll {
@@ -1699,61 +1901,43 @@ func rulesetTriggerMatches(all []interfaceInfo, trigger rulesetTrigger, matchAll
 	return matched > 0
 }
 
-func systemHasInterfaceType(all []interfaceInfo, typ string) bool {
-	for _, iface := range all {
-		if iface.Type == typ {
-			return true
-		}
-	}
-	return false
-}
-
-func systemHasInterfaceName(all []interfaceInfo, name string) bool {
-	for _, iface := range all {
-		if iface.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-func systemHasInterfaceRegexp(all []interfaceInfo, pattern string) bool {
-	for _, iface := range all {
-		if regexp.MustCompile(pattern).MatchString(iface.Name) {
-			return true
-		}
-	}
-	return false
-}
-
-func systemHasIPAddr(all []interfaceInfo, addr netip.Addr) bool {
-	addr = addr.Unmap()
-	for _, iface := range all {
-		for _, ifaceAddr := range iface.Addrs {
-			if ifaceAddr.Unmap() == addr {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func writeRuntimeConfig(m *ebpf.Map, config runtimeConfig) error {
-	var key uint32
-	if err := m.Update(key, config, ebpf.UpdateAny); err != nil {
+func writeRuntimeConfig(m *ebpf.Map, ifindex uint32, config runtimeConfig) error {
+	if err := m.Update(ifindex, config, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update runtime_config map: %w", err)
 	}
 	return nil
 }
 
-func writeEffectivePolicy(objs *killswitchObjects, rules allowRules) error {
-	if err := clearAllowlists(objs); err != nil {
+func writeEffectivePolicies(objs *killswitchObjects, current, next map[int]interfacePolicy) error {
+	if objs == nil {
+		return nil
+	}
+	for index := range current {
+		if _, ok := next[index]; !ok {
+			if err := clearPolicyForInterface(objs, uint32(index)); err != nil {
+				return err
+			}
+		}
+	}
+	for index, policy := range next {
+		if currentPolicy, ok := current[index]; ok && allowRulesEqual(currentPolicy.Rules, policy.Rules) {
+			continue
+		}
+		if err := writeEffectivePolicyForInterface(objs, uint32(index), policy.Rules); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeEffectivePolicyForInterface(objs *killswitchObjects, ifindex uint32, rules allowRules) error {
+	if err := clearPolicyForInterface(objs, ifindex); err != nil {
 		return err
 	}
-	if err := writeAllowlists(objs, rules); err != nil {
+	if err := writeAllowlists(objs, ifindex, rules); err != nil {
 		return err
 	}
-	if err := writeRuntimeConfig(objs.RuntimeConfig, runtimeConfig{
+	if err := writeRuntimeConfig(objs.RuntimeConfig, ifindex, runtimeConfig{
 		AllowAll: boolByte(rules.AllowAll),
 		EnableV4: boolByte(rules.EnableV4),
 		EnableV6: boolByte(rules.EnableV6),
@@ -1763,33 +1947,46 @@ func writeEffectivePolicy(objs *killswitchObjects, rules allowRules) error {
 	return nil
 }
 
-func clearAllowlists(objs *killswitchObjects) error {
-	if err := clearAllowedMap[uint32](objs.AllowedMarks, "allowed_marks"); err != nil {
+func clearPolicyForInterface(objs *killswitchObjects, ifindex uint32) error {
+	if err := clearRuntimeConfig(objs.RuntimeConfig, ifindex); err != nil {
 		return err
 	}
-	if err := clearAllowedMap[portKey](objs.AllowedPorts, "allowed_ports"); err != nil {
+	if err := clearAllowedMapForInterface[markPolicyKey](objs.AllowedMarks, "allowed_marks", ifindex, func(k markPolicyKey) uint32 { return k.Ifindex }); err != nil {
 		return err
 	}
-	if err := clearAllowedMap[uint32](objs.AllowedV4Hosts, "allowed_v4_hosts"); err != nil {
+	if err := clearAllowedMapForInterface[portPolicyKey](objs.AllowedPorts, "allowed_ports", ifindex, func(k portPolicyKey) uint32 { return k.Ifindex }); err != nil {
 		return err
 	}
-	if err := clearAllowedMap[ipv6AddrKey](objs.AllowedV6Hosts, "allowed_v6_hosts"); err != nil {
+	if err := clearAllowedMapForInterface[v4HostPolicyKey](objs.AllowedV4Hosts, "allowed_v4_hosts", ifindex, func(k v4HostPolicyKey) uint32 { return k.Ifindex }); err != nil {
 		return err
 	}
-	if err := clearAllowedMap[hostport4Key](objs.AllowedV4Hostports, "allowed_v4_hostports"); err != nil {
+	if err := clearAllowedMapForInterface[v6HostPolicyKey](objs.AllowedV6Hosts, "allowed_v6_hosts", ifindex, func(k v6HostPolicyKey) uint32 { return k.Ifindex }); err != nil {
 		return err
 	}
-	if err := clearAllowedMap[hostport6Key](objs.AllowedV6Hostports, "allowed_v6_hostports"); err != nil {
+	if err := clearAllowedMapForInterface[hostport4PolicyKey](objs.AllowedV4Hostports, "allowed_v4_hostports", ifindex, func(k hostport4PolicyKey) uint32 { return k.Ifindex }); err != nil {
+		return err
+	}
+	if err := clearAllowedMapForInterface[hostport6PolicyKey](objs.AllowedV6Hostports, "allowed_v6_hostports", ifindex, func(k hostport6PolicyKey) uint32 { return k.Ifindex }); err != nil {
 		return err
 	}
 	return nil
 }
 
-func clearAllowedMap[K comparable](m *ebpf.Map, name string) error {
+func clearRuntimeConfig(m *ebpf.Map, ifindex uint32) error {
+	if err := m.Delete(ifindex); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("delete runtime_config map entry: %w", err)
+	}
+	return nil
+}
+
+func clearAllowedMapForInterface[K comparable](m *ebpf.Map, name string, ifindex uint32, keyIfindex func(K) uint32) error {
 	var key K
 	var value uint8
 	entries := m.Iterate()
 	for entries.Next(&key, &value) {
+		if keyIfindex(key) != ifindex {
+			continue
+		}
 		if err := m.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete %s map entry: %w", name, err)
 		}
@@ -1800,30 +1997,34 @@ func clearAllowedMap[K comparable](m *ebpf.Map, name string) error {
 	return nil
 }
 
-func writeAllowlists(objs *killswitchObjects, rules allowRules) error {
-	if err := writeAllowedMarks(objs.AllowedMarks, rules.AllowedMarks); err != nil {
+func writeAllowlists(objs *killswitchObjects, ifindex uint32, rules allowRules) error {
+	if err := writeAllowedMarks(objs.AllowedMarks, ifindex, rules.AllowedMarks); err != nil {
 		return err
 	}
-	if err := writeAllowedMap(objs.AllowedPorts, rules.AllowedPorts, "allowed_ports"); err != nil {
+	if err := writeAllowedMap(objs.AllowedPorts, scopedPortKeys(ifindex, rules.AllowedPorts), "allowed_ports"); err != nil {
 		return err
 	}
-	if err := writeAllowedMap(objs.AllowedV4Hosts, rules.AllowedV4Hosts, "allowed_v4_hosts"); err != nil {
+	if err := writeAllowedMap(objs.AllowedV4Hosts, scopedV4HostKeys(ifindex, rules.AllowedV4Hosts), "allowed_v4_hosts"); err != nil {
 		return err
 	}
-	if err := writeAllowedMap(objs.AllowedV6Hosts, rules.AllowedV6Hosts, "allowed_v6_hosts"); err != nil {
+	if err := writeAllowedMap(objs.AllowedV6Hosts, scopedV6HostKeys(ifindex, rules.AllowedV6Hosts), "allowed_v6_hosts"); err != nil {
 		return err
 	}
-	if err := writeAllowedMap(objs.AllowedV4Hostports, rules.AllowedV4Pairs, "allowed_v4_hostports"); err != nil {
+	if err := writeAllowedMap(objs.AllowedV4Hostports, scopedV4HostportKeys(ifindex, rules.AllowedV4Pairs), "allowed_v4_hostports"); err != nil {
 		return err
 	}
-	if err := writeAllowedMap(objs.AllowedV6Hostports, rules.AllowedV6Pairs, "allowed_v6_hostports"); err != nil {
+	if err := writeAllowedMap(objs.AllowedV6Hostports, scopedV6HostportKeys(ifindex, rules.AllowedV6Pairs), "allowed_v6_hostports"); err != nil {
 		return err
 	}
 	return nil
 }
 
-func writeAllowedMarks(m *ebpf.Map, marks []uint32) error {
-	return writeAllowedMap(m, marks, "allowed_marks")
+func writeAllowedMarks(m *ebpf.Map, ifindex uint32, marks []uint32) error {
+	keys := make([]markPolicyKey, 0, len(marks))
+	for _, mark := range marks {
+		keys = append(keys, markPolicyKey{Ifindex: ifindex, Mark: mark})
+	}
+	return writeAllowedMap(m, keys, "allowed_marks")
 }
 
 func writeAllowedMap[K comparable](m *ebpf.Map, keys []K, name string) error {
@@ -1834,6 +2035,56 @@ func writeAllowedMap[K comparable](m *ebpf.Map, keys []K, name string) error {
 		}
 	}
 	return nil
+}
+
+func scopedPortKeys(ifindex uint32, values []portKey) []portPolicyKey {
+	out := make([]portPolicyKey, 0, len(values))
+	for _, value := range values {
+		out = append(out, portPolicyKey{Ifindex: ifindex, Dport: value.Dport, Protocol: value.Protocol})
+	}
+	return out
+}
+
+func scopedV4HostKeys(ifindex uint32, values []uint32) []v4HostPolicyKey {
+	out := make([]v4HostPolicyKey, 0, len(values))
+	for _, value := range values {
+		out = append(out, v4HostPolicyKey{Ifindex: ifindex, Daddr: value})
+	}
+	return out
+}
+
+func scopedV6HostKeys(ifindex uint32, values []ipv6AddrKey) []v6HostPolicyKey {
+	out := make([]v6HostPolicyKey, 0, len(values))
+	for _, value := range values {
+		out = append(out, v6HostPolicyKey{Ifindex: ifindex, Addr: value.Addr})
+	}
+	return out
+}
+
+func scopedV4HostportKeys(ifindex uint32, values []hostport4Key) []hostport4PolicyKey {
+	out := make([]hostport4PolicyKey, 0, len(values))
+	for _, value := range values {
+		out = append(out, hostport4PolicyKey{
+			Ifindex:  ifindex,
+			Daddr:    value.Daddr,
+			Dport:    value.Dport,
+			Protocol: value.Protocol,
+		})
+	}
+	return out
+}
+
+func scopedV6HostportKeys(ifindex uint32, values []hostport6Key) []hostport6PolicyKey {
+	out := make([]hostport6PolicyKey, 0, len(values))
+	for _, value := range values {
+		out = append(out, hostport6PolicyKey{
+			Ifindex:  ifindex,
+			Daddr:    value.Daddr,
+			Dport:    value.Dport,
+			Protocol: value.Protocol,
+		})
+	}
+	return out
 }
 
 func mergeAllowRules(base allowRules, overlay allowRules) allowRules {
@@ -1904,18 +2155,79 @@ func allowRulesEqual(a, b allowRules) bool {
 	return reflect.DeepEqual(canonicalAllowRules(a), canonicalAllowRules(b))
 }
 
-func logPolicy(activeRuleset string, temporaryRulesets int, rules allowRules) {
+func interfacePolicyRulesEqual(a, b map[int]interfacePolicy) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for index, aPolicy := range a {
+		bPolicy, ok := b[index]
+		if !ok {
+			return false
+		}
+		if aPolicy.Info.Name != bPolicy.Info.Name || aPolicy.Info.Type != bPolicy.Info.Type || !reflect.DeepEqual(aPolicy.Info.Addrs, bPolicy.Info.Addrs) {
+			return false
+		}
+		if !allowRulesEqual(aPolicy.Rules, bPolicy.Rules) {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneInterfacePolicyMap(values map[int]interfacePolicy) map[int]interfacePolicy {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[int]interfacePolicy, len(values))
+	for index, value := range values {
+		value.Info.Addrs = append([]netip.Addr(nil), value.Info.Addrs...)
+		value.Rules = cloneAllowRules(value.Rules)
+		value.ActiveRulesets = cloneStrings(value.ActiveRulesets)
+		value.ForcedRulesets = cloneStrings(value.ForcedRulesets)
+		value.TemporaryRulesets = cloneStrings(value.TemporaryRulesets)
+		out[index] = value
+	}
+	return out
+}
+
+func logPolicies(policies map[int]interfacePolicy) {
+	if len(policies) == 0 {
+		log.Print("Effective policies: none")
+		return
+	}
+	for _, policy := range sortedInterfacePolicies(policies) {
+		logPolicy(policy)
+	}
+}
+
+func sortedInterfacePolicies(policies map[int]interfacePolicy) []interfacePolicy {
+	out := make([]interfacePolicy, 0, len(policies))
+	for _, policy := range policies {
+		out = append(out, policy)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Info.Name != out[j].Info.Name {
+			return out[i].Info.Name < out[j].Info.Name
+		}
+		return out[i].Info.Index < out[j].Info.Index
+	})
+	return out
+}
+
+func logPolicy(policy interfacePolicy) {
+	rules := policy.Rules
 	if rules.AllowAll {
-		log.Print("WARNING: AllowAll is enabled; protected interfaces will pass all traffic")
+		log.Printf("WARNING: AllowAll is enabled on %s(index %d); protected interface will pass all traffic", policy.Info.Name, policy.Info.Index)
 	}
-	if activeRuleset == "" {
-		log.Print("Active ruleset: none")
-	} else {
-		log.Printf("Active ruleset: %s", activeRuleset)
-	}
-	log.Printf("Temporary rulesets: %d", temporaryRulesets)
-	log.Printf("Runtime config: allow_all=%t enable_v4=%t enable_v6=%t", rules.AllowAll, rules.EnableV4, rules.EnableV6)
-	log.Printf("Allowlists: marks=%d ports=%d v4_hosts=%d v6_hosts=%d v4_hostports=%d v6_hostports=%d",
+	log.Printf("Effective policy for %s(index %d): active_rulesets=%s forced_rulesets=%s temporary_rulesets=%d allow_all=%t enable_v4=%t enable_v6=%t allowlists marks=%d ports=%d v4_hosts=%d v6_hosts=%d v4_hostports=%d v6_hostports=%d",
+		policy.Info.Name,
+		policy.Info.Index,
+		strings.Join(policy.ActiveRulesets, ","),
+		strings.Join(policy.ForcedRulesets, ","),
+		len(policy.TemporaryRulesets),
+		rules.AllowAll,
+		rules.EnableV4,
+		rules.EnableV6,
 		len(rules.AllowedMarks),
 		len(rules.AllowedPorts),
 		len(rules.AllowedV4Hosts),
@@ -2198,8 +2510,15 @@ func watchInterfaces(ctx context.Context, manager *egressManager, policies *poli
 	if _, err := manager.reconcileCurrent(policies.optionsSnapshot(), true); err != nil {
 		return err
 	}
+	policyChanged, err := policies.reconcileAttached(manager, true)
+	if err != nil {
+		return err
+	}
 	if notify != nil {
 		notify(adminapi.EventTypeInterfaces)
+		if policyChanged {
+			notify(adminapi.EventTypeConfig)
+		}
 	}
 
 	for {
@@ -2212,28 +2531,39 @@ func watchInterfaces(ctx context.Context, manager *egressManager, policies *poli
 			reconcileMu.Lock()
 			opts := policies.optionsSnapshot()
 			shouldReconcileAttachments := manager.shouldReconcileLinkUpdate(update, opts)
+			interfacesChanged := false
 			if shouldReconcileAttachments {
-				if _, err := manager.reconcileCurrent(opts, false); err != nil {
+				var err error
+				interfacesChanged, err = manager.reconcileCurrent(opts, false)
+				if err != nil {
 					log.Printf("ERROR: reconcile interfaces after netlink update: %s", err)
 				}
 			}
-			if _, err := policies.reconcileCurrent(true); err != nil {
+			policyChanged, err := policies.reconcileAttached(manager, true)
+			if err != nil {
 				log.Printf("ERROR: reconcile rulesets after netlink link update: %s", err)
 			}
 			reconcileMu.Unlock()
 			if notify != nil {
-				notify(adminapi.EventTypeInterfaces)
-				notify(adminapi.EventTypeConfig)
+				if interfacesChanged {
+					notify(adminapi.EventTypeInterfaces)
+				}
+				if policyChanged {
+					notify(adminapi.EventTypeConfig)
+				}
 			}
 		case <-addrUpdates:
 			reconcileMu.Lock()
-			if _, err := policies.reconcileCurrent(true); err != nil {
+			policyChanged, err := policies.reconcileAttached(manager, true)
+			if err != nil {
 				log.Printf("ERROR: reconcile rulesets after netlink addr update: %s", err)
 			}
 			reconcileMu.Unlock()
 			if notify != nil {
-				notify(adminapi.EventTypeInterfaces)
-				notify(adminapi.EventTypeConfig)
+				if policyChanged {
+					notify(adminapi.EventTypeInterfaces)
+					notify(adminapi.EventTypeConfig)
+				}
 			}
 		}
 	}

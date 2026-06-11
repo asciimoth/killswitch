@@ -111,7 +111,6 @@ func TestConfigToOptionsParsesRulesets(t *testing.T) {
 		Rulesets: map[string]rulesetConfig{
 			"office": {
 				Disabled:       true,
-				Priority:       20,
 				Match:          "and",
 				Trigger:        triggerConfig{InterfaceNames: []string{"wg0"}, IPAddrs: []string{"10.64.0.2"}},
 				EnableV6:       true,
@@ -127,7 +126,7 @@ func TestConfigToOptionsParsesRulesets(t *testing.T) {
 		t.Fatalf("rulesets count = %d", len(opts.Rulesets))
 	}
 	ruleset := opts.Rulesets[0]
-	if ruleset.Name != "office" || !ruleset.Disabled || ruleset.Priority != 20 || !ruleset.MatchAll {
+	if ruleset.Name != "office" || !ruleset.Disabled || !ruleset.MatchAll {
 		t.Fatalf("unexpected ruleset metadata: %+v", ruleset)
 	}
 	if len(ruleset.Trigger.InterfaceNames) != 1 || ruleset.Trigger.InterfaceNames[0] != "wg0" {
@@ -315,20 +314,17 @@ func TestSelectInterfacesIgnoreRulesOverrideIncludes(t *testing.T) {
 	}
 }
 
-func TestActiveRulesetSelectsHighestPriorityCandidate(t *testing.T) {
-	all := []interfaceInfo{
-		{Name: "eth0", Index: 2, Type: "device", Addrs: []netip.Addr{netipMustParse("192.0.2.44")}},
-		{Name: "wg0", Index: 3, Type: "wireguard", Addrs: []netip.Addr{netipMustParse("10.64.0.2")}},
-	}
+func TestActiveRulesetsMatchCandidateInterface(t *testing.T) {
+	iface := interfaceInfo{Name: "wg0", Index: 3, Type: "wireguard", Addrs: []netip.Addr{netipMustParse("10.64.0.2")}}
 	rulesets := []ruleset{
-		{Name: "low", Priority: 10, Trigger: rulesetTrigger{InterfaceTypes: []string{"device"}}},
-		{Name: "high", Priority: 50, Trigger: rulesetTrigger{InterfaceRegexps: []string{"^wg"}}},
-		{Name: "inactive", Priority: 100, Trigger: rulesetTrigger{InterfaceNames: []string{"tun0"}}},
+		{Name: "type", Trigger: rulesetTrigger{InterfaceTypes: []string{"wireguard"}}},
+		{Name: "name", Trigger: rulesetTrigger{InterfaceRegexps: []string{"^wg"}}},
+		{Name: "inactive", Trigger: rulesetTrigger{InterfaceNames: []string{"tun0"}}},
 	}
 
-	active := activeRuleset(all, rulesets)
-	if active == nil || active.Name != "high" {
-		t.Fatalf("active ruleset = %+v", active)
+	active := activeRulesetsForInterface(iface, rulesets)
+	if got := strings.Join(rulesetNames(active), ", "); got != "name, type" {
+		t.Fatalf("active rulesets = %q", got)
 	}
 }
 
@@ -337,18 +333,18 @@ func TestActiveRulesetIgnoresDisabledRulesets(t *testing.T) {
 		{Name: "wg0", Index: 3, Type: "wireguard", Addrs: []netip.Addr{netipMustParse("10.64.0.2")}},
 	}
 	rulesets := []ruleset{
-		{Name: "disabled", Disabled: true, Priority: 100, Trigger: rulesetTrigger{InterfaceNames: []string{"wg0"}}},
-		{Name: "enabled", Priority: 10, Trigger: rulesetTrigger{InterfaceNames: []string{"wg0"}}},
+		{Name: "disabled", Disabled: true, Trigger: rulesetTrigger{InterfaceNames: []string{"wg0"}}},
+		{Name: "enabled", Trigger: rulesetTrigger{InterfaceNames: []string{"wg0"}}},
 	}
 
-	active := activeRuleset(all, rulesets)
-	if active == nil || active.Name != "enabled" {
-		t.Fatalf("active ruleset = %+v", active)
+	active := activeRulesetsForInterface(all[0], rulesets)
+	if got := strings.Join(rulesetNames(active), ", "); got != "enabled" {
+		t.Fatalf("active rulesets = %q", got)
 	}
 
 	rulesets[1].Disabled = true
-	if active := activeRuleset(all, rulesets); active != nil {
-		t.Fatalf("active ruleset = %+v", active)
+	if active := activeRulesetsForInterface(all[0], rulesets); len(active) != 0 {
+		t.Fatalf("active rulesets = %+v", active)
 	}
 }
 
@@ -360,15 +356,15 @@ func TestRulesetTriggerANDRequiresAllTriggers(t *testing.T) {
 		InterfaceNames: []string{"wg0"},
 		IPAddrs:        []netip.Addr{netipMustParse("10.64.0.2")},
 	}
-	if !rulesetTriggerMatches(all, trigger, true) {
+	if !rulesetTriggerMatchesInterface(all[0], trigger, true) {
 		t.Fatal("expected AND trigger to match when all predicates are present")
 	}
 
 	trigger.IPAddrs = []netip.Addr{netipMustParse("10.64.0.3")}
-	if rulesetTriggerMatches(all, trigger, true) {
+	if rulesetTriggerMatchesInterface(all[0], trigger, true) {
 		t.Fatal("expected AND trigger to miss when one predicate is absent")
 	}
-	if !rulesetTriggerMatches(all, trigger, false) {
+	if !rulesetTriggerMatchesInterface(all[0], trigger, false) {
 		t.Fatal("expected OR trigger to match when one predicate is present")
 	}
 }
@@ -405,21 +401,23 @@ func TestMergeAllowRulesAllowsEitherSide(t *testing.T) {
 func TestPolicyManagerSkipsUnchangedEffectiveRules(t *testing.T) {
 	manager := &policyManager{
 		opts: options{
-			allowRules: allowRules{EnableV4: true},
+			InterfaceNames: []string{"wg0"},
+			allowRules:     allowRules{EnableV4: true},
 			Rulesets: []ruleset{
 				{
 					Name:       "same",
-					Priority:   10,
 					Trigger:    rulesetTrigger{InterfaceNames: []string{"wg0"}},
 					allowRules: allowRules{EnableV4: true},
 				},
 			},
 		},
-		current: allowRules{EnableV4: true},
-		set:     true,
+		current: map[int]interfacePolicy{
+			3: {Info: interfaceInfo{Name: "wg0", Index: 3, Type: "wireguard"}, Rules: allowRules{EnableV4: true}, ActiveRulesets: []string{"same"}},
+		},
+		set: true,
 	}
 
-	changed, err := manager.reconcile([]interfaceInfo{{Name: "wg0", Type: "wireguard"}}, true)
+	changed, err := manager.reconcile([]interfaceInfo{{Name: "wg0", Index: 3, Type: "wireguard"}}, true)
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
@@ -431,43 +429,47 @@ func TestPolicyManagerSkipsUnchangedEffectiveRules(t *testing.T) {
 func TestPolicyManagerRecomputesActiveRulesetAndSkipsUnchangedEffectiveRules(t *testing.T) {
 	manager := &policyManager{
 		opts: options{
-			allowRules: allowRules{EnableV4: true},
+			InterfaceNames: []string{"wg0"},
+			allowRules:     allowRules{EnableV4: true},
 			Rulesets: []ruleset{
 				{
 					Name:       "home",
-					Priority:   10,
 					Trigger:    rulesetTrigger{InterfaceNames: []string{"eth0"}},
 					allowRules: allowRules{AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}},
 				},
 				{
 					Name:       "office",
-					Priority:   20,
 					Trigger:    rulesetTrigger{InterfaceNames: []string{"wg0"}},
 					allowRules: allowRules{AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}},
 				},
 			},
 		},
-		current:    canonicalAllowRules(allowRules{EnableV4: true, AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}}),
-		activeName: "home",
-		set:        true,
+		current: map[int]interfacePolicy{
+			3: {
+				Info:           interfaceInfo{Name: "wg0", Index: 3, Type: "wireguard"},
+				Rules:          canonicalAllowRules(allowRules{EnableV4: true, AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}}),
+				ActiveRulesets: []string{"office"},
+			},
+		},
+		set: true,
 	}
 
-	changed, err := manager.reconcile([]interfaceInfo{{Name: "wg0", Type: "wireguard"}}, true)
+	changed, err := manager.reconcile([]interfaceInfo{{Name: "wg0", Index: 3, Type: "wireguard"}}, true)
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if changed {
 		t.Fatal("expected unchanged effective policy to be skipped")
 	}
-	if manager.activeName != "office" {
-		t.Fatalf("active ruleset = %q", manager.activeName)
+	if got := strings.Join(manager.current[3].ActiveRulesets, ", "); got != "office" {
+		t.Fatalf("active rulesets = %q", got)
 	}
 }
 
 func TestApplyAdminMutationRecomputesAndSkipsUnchangedEffectiveRules(t *testing.T) {
 	policies := &policyManager{
 		opts:    options{InterfaceNames: []string{"killswitch-test-no-such-interface"}, allowRules: allowRules{EnableV4: true}},
-		current: allowRules{EnableV4: true},
+		current: nil,
 		set:     true,
 	}
 	var reconcileMu sync.Mutex
@@ -491,13 +493,15 @@ func TestApplyAdminMutationRecomputesAndSkipsUnchangedEffectiveRules(t *testing.
 
 func TestPolicyManagerTemporaryRulesetMutationsSkipUnchangedEffectiveRules(t *testing.T) {
 	manager := &policyManager{
-		opts:    options{allowRules: allowRules{EnableV4: true}},
-		current: allowRules{EnableV4: true},
-		set:     true,
+		opts: options{InterfaceNames: []string{"wg0"}, allowRules: allowRules{EnableV4: true}},
+		current: map[int]interfacePolicy{
+			3: {Info: interfaceInfo{Name: "wg0", Index: 3, Type: "wireguard"}, Rules: allowRules{EnableV4: true}},
+		},
+		set: true,
 	}
 
-	manager.setTemporaryRuleset("client", allowRules{EnableV4: true})
-	changed, err := manager.reconcile(nil, true)
+	manager.setTemporaryRuleset("client", []string{"wg0"}, allowRules{EnableV4: true})
+	changed, err := manager.reconcile([]interfaceInfo{{Name: "wg0", Index: 3, Type: "wireguard"}}, true)
 	if err != nil {
 		t.Fatalf("reconcile after tmp set: %v", err)
 	}
@@ -505,8 +509,8 @@ func TestPolicyManagerTemporaryRulesetMutationsSkipUnchangedEffectiveRules(t *te
 		t.Fatal("expected tmp set with unchanged effective policy to be skipped")
 	}
 
-	manager.setTemporaryRuleset("client", allowRules{EnableV4: true})
-	changed, err = manager.reconcile(nil, true)
+	manager.setTemporaryRuleset("client", []string{"wg0"}, allowRules{EnableV4: true})
+	changed, err = manager.reconcile([]interfaceInfo{{Name: "wg0", Index: 3, Type: "wireguard"}}, true)
 	if err != nil {
 		t.Fatalf("reconcile after tmp update: %v", err)
 	}
@@ -517,7 +521,7 @@ func TestPolicyManagerTemporaryRulesetMutationsSkipUnchangedEffectiveRules(t *te
 	if !manager.removeTemporaryRuleset("client") {
 		t.Fatal("expected tmp ruleset to be removed")
 	}
-	changed, err = manager.reconcile(nil, true)
+	changed, err = manager.reconcile([]interfaceInfo{{Name: "wg0", Index: 3, Type: "wireguard"}}, true)
 	if err != nil {
 		t.Fatalf("reconcile after tmp remove: %v", err)
 	}
@@ -527,17 +531,17 @@ func TestPolicyManagerTemporaryRulesetMutationsSkipUnchangedEffectiveRules(t *te
 }
 
 func TestEffectiveAllowRulesMergesTemporaryRulesets(t *testing.T) {
-	active := &ruleset{
+	active := []ruleset{{
 		Name:       "office",
 		allowRules: allowRules{AllowedMarks: []uint32{0x42}},
-	}
+	}}
 	effective := effectiveAllowRules(
 		allowRules{EnableV4: true, AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}},
 		active,
 		nil,
 		[]temporaryRuleset{
-			{Owner: "client-b", Rules: allowRules{EnableV6: true, AllowedV6Hosts: []ipv6AddrKey{ipv6Key(netipMustParse("2001:db8::10"))}}},
-			{Owner: "client-a", Rules: allowRules{AllowedV4Hosts: []uint32{ipv4Key(netipMustParse("192.0.2.10"))}}},
+			{Owner: "client-b", Interfaces: []string{"wg0"}, Rules: allowRules{EnableV6: true, AllowedV6Hosts: []ipv6AddrKey{ipv6Key(netipMustParse("2001:db8::10"))}}},
+			{Owner: "client-a", Interfaces: []string{"wg0"}, Rules: allowRules{AllowedV4Hosts: []uint32{ipv4Key(netipMustParse("192.0.2.10"))}}},
 		},
 	)
 
@@ -555,7 +559,7 @@ func TestEffectiveAllowRulesMergesTemporaryRulesets(t *testing.T) {
 func TestEffectiveAllowRulesMergesForceActiveRulesets(t *testing.T) {
 	effective := effectiveAllowRules(
 		allowRules{EnableV4: true},
-		&ruleset{Name: "active", allowRules: allowRules{AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}}},
+		[]ruleset{{Name: "active", allowRules: allowRules{AllowedPorts: []portKey{{Dport: htons(443), Protocol: ipProtoTCP}}}}},
 		[]ruleset{
 			{
 				Name:       "disabled",
@@ -578,6 +582,87 @@ func TestEffectiveAllowRulesMergesForceActiveRulesets(t *testing.T) {
 	}
 }
 
+func TestEffectivePoliciesAreIndependentPerInterface(t *testing.T) {
+	opts := options{
+		InterfaceNames: []string{"wg0", "eth0"},
+		allowRules: allowRules{
+			EnableV4:       true,
+			AllowedPorts:   []portKey{{Dport: htons(443), Protocol: ipProtoTCP}},
+			AllowedV4Hosts: []uint32{ipv4Key(netipMustParse("192.0.2.10"))},
+		},
+		Rulesets: []ruleset{
+			{
+				Name:       "wg",
+				Trigger:    rulesetTrigger{InterfaceNames: []string{"wg0"}},
+				allowRules: allowRules{EnableV6: true},
+			},
+			{
+				Name:       "eth",
+				Trigger:    rulesetTrigger{InterfaceNames: []string{"eth0"}},
+				allowRules: allowRules{AllowedV4Hosts: []uint32{ipv4Key(netipMustParse("198.51.100.10"))}},
+			},
+			{
+				Name:       "disabled",
+				Disabled:   true,
+				Trigger:    rulesetTrigger{InterfaceNames: []string{"wg0"}},
+				allowRules: allowRules{AllowAll: true},
+			},
+			{
+				Name:       "forced",
+				Disabled:   true,
+				Trigger:    rulesetTrigger{InterfaceNames: []string{"does-not-match"}},
+				allowRules: allowRules{AllowedMarks: []uint32{0x42}},
+			},
+		},
+	}
+	tmpRulesets := []temporaryRuleset{
+		{Owner: "client-wg", Interfaces: []string{"wg0"}, Rules: allowRules{AllowedV6Hosts: []ipv6AddrKey{ipv6Key(netipMustParse("2001:db8::10"))}}},
+		{Owner: "client-pending", Interfaces: []string{"tun9"}, Rules: allowRules{AllowAll: true}},
+	}
+	forceRulesets := []forceRuleset{
+		{Name: "forced", Owners: []string{"client-force"}, Interfaces: []string{"eth0"}},
+	}
+
+	policies := effectivePoliciesForInterfaces([]interfaceInfo{
+		{Name: "wg0", Index: 3, Type: "wireguard"},
+		{Name: "eth0", Index: 4, Type: "device"},
+	}, opts, tmpRulesets, forceRulesets)
+
+	if len(policies) != 2 {
+		t.Fatalf("policies = %+v", policies)
+	}
+	wg := policies[3]
+	if got := strings.Join(wg.ActiveRulesets, ", "); got != "wg" {
+		t.Fatalf("wg active rulesets = %q", got)
+	}
+	if !wg.Rules.EnableV4 || !wg.Rules.EnableV6 || wg.Rules.AllowAll {
+		t.Fatalf("wg rules flags = %+v", wg.Rules)
+	}
+	if len(wg.Rules.AllowedPorts) != 1 || len(wg.Rules.AllowedV4Hosts) != 1 || len(wg.Rules.AllowedV6Hosts) != 1 || len(wg.Rules.AllowedMarks) != 0 {
+		t.Fatalf("wg rules allowlists = %+v", wg.Rules)
+	}
+	if got := strings.Join(wg.TemporaryRulesets, ", "); got != "client-wg" {
+		t.Fatalf("wg temporary rulesets = %q", got)
+	}
+
+	eth := policies[4]
+	if got := strings.Join(eth.ActiveRulesets, ", "); got != "eth" {
+		t.Fatalf("eth active rulesets = %q", got)
+	}
+	if got := strings.Join(eth.ForcedRulesets, ", "); got != "forced" {
+		t.Fatalf("eth forced rulesets = %q", got)
+	}
+	if !eth.Rules.EnableV4 || eth.Rules.EnableV6 || eth.Rules.AllowAll {
+		t.Fatalf("eth rules flags = %+v", eth.Rules)
+	}
+	if len(eth.Rules.AllowedPorts) != 1 || len(eth.Rules.AllowedV4Hosts) != 2 || len(eth.Rules.AllowedMarks) != 1 || len(eth.Rules.AllowedV6Hosts) != 0 {
+		t.Fatalf("eth rules allowlists = %+v", eth.Rules)
+	}
+	if len(eth.TemporaryRulesets) != 0 {
+		t.Fatalf("eth temporary rulesets = %+v", eth.TemporaryRulesets)
+	}
+}
+
 func TestPolicyManagerForceRulesetReferenceCounting(t *testing.T) {
 	manager := &policyManager{
 		opts: options{
@@ -585,21 +670,21 @@ func TestPolicyManagerForceRulesetReferenceCounting(t *testing.T) {
 				{Name: "office", Disabled: true, allowRules: allowRules{EnableV6: true}},
 			},
 		},
-		current: allowRules{},
+		current: nil,
 		set:     true,
 	}
 
-	if !manager.forceActivateRuleset("client-a", "office") {
+	if !manager.forceActivateRuleset("client-a", "office", []string{"wg0"}, false) {
 		t.Fatal("expected force activation to be accepted")
 	}
-	if !manager.forceActivateRuleset("client-b", "office") {
+	if !manager.forceActivateRuleset("client-b", "office", []string{"wg0"}, false) {
 		t.Fatal("expected second force activation to be accepted")
 	}
 	forced := manager.forceRulesetsSnapshot()
 	if len(forced) != 1 || len(forced[0].Owners) != 2 {
 		t.Fatalf("force-active rulesets = %+v", forced)
 	}
-	effective := effectiveAllowRules(allowRules{}, nil, forcedRulesets(manager.optionsSnapshot().Rulesets, forced), nil)
+	effective := effectiveAllowRules(allowRules{}, nil, forcedRulesetsForInterface(manager.optionsSnapshot().Rulesets, forced, "wg0"), nil)
 	if !effective.EnableV6 {
 		t.Fatalf("expected force-active ruleset to affect policy: %+v", effective)
 	}
@@ -620,13 +705,71 @@ func TestPolicyManagerForceRulesetReferenceCounting(t *testing.T) {
 	}
 }
 
+func TestPolicyManagerForceRulesetSetReplacesClientInterfaces(t *testing.T) {
+	manager := &policyManager{
+		opts: options{
+			Rulesets: []ruleset{{Name: "office", allowRules: allowRules{EnableV6: true}}},
+		},
+	}
+
+	if !manager.forceActivateRuleset("client-a", "office", []string{"wg0", "eth0"}, true) {
+		t.Fatal("expected force activation to be accepted")
+	}
+	if !manager.forceActivateRuleset("client-a", "office", []string{"tun0"}, true) {
+		t.Fatal("expected replacement force activation to be accepted")
+	}
+
+	forced := manager.forceRulesetsSnapshot()
+	if len(forced) != 1 {
+		t.Fatalf("force-active rulesets = %+v", forced)
+	}
+	if got := strings.Join(forced[0].Interfaces, ", "); got != "tun0" {
+		t.Fatalf("force-active interfaces = %q", got)
+	}
+}
+
+func TestPolicyManagerForceRulesetReleaseDecrementsClientInterface(t *testing.T) {
+	manager := &policyManager{
+		opts: options{
+			Rulesets: []ruleset{{Name: "office", allowRules: allowRules{EnableV6: true}}},
+		},
+	}
+
+	if !manager.forceActivateRuleset("client-a", "office", []string{"wg0"}, false) {
+		t.Fatal("expected first force activation to be accepted")
+	}
+	if !manager.forceActivateRuleset("client-a", "office", []string{"wg0"}, false) {
+		t.Fatal("expected second force activation to be accepted")
+	}
+	if !manager.releaseForceRuleset("client-a", "office", []string{"wg0"}) {
+		t.Fatal("expected one force activation to be released")
+	}
+
+	forced := manager.forceRulesetsSnapshot()
+	if len(forced) != 1 || len(forced[0].Owners) != 1 || forced[0].Owners[0] != "client-a" {
+		t.Fatalf("expected one client activation to remain: %+v", forced)
+	}
+	if got := strings.Join(forced[0].Interfaces, ", "); got != "wg0" {
+		t.Fatalf("force-active interfaces = %q", got)
+	}
+
+	if !manager.releaseForceRuleset("client-a", "office", []string{"wg0"}) {
+		t.Fatal("expected final force activation to be released")
+	}
+	if forced := manager.forceRulesetsSnapshot(); len(forced) != 0 {
+		t.Fatalf("expected forced ruleset to be fully released: %+v", forced)
+	}
+}
+
 func TestPolicyManagerConfigSnapshotIncludesTemporaryRulesets(t *testing.T) {
 	manager := &policyManager{
-		opts:    options{allowRules: allowRules{EnableV4: true}},
-		current: allowRules{EnableV4: true, EnableV6: true},
-		tmpRulesets: map[string]allowRules{
-			"client-b": {EnableV6: true},
-			"client-a": {AllowedPorts: []portKey{{Dport: htons(53), Protocol: ipProtoUDP}}},
+		opts: options{allowRules: allowRules{EnableV4: true}},
+		current: map[int]interfacePolicy{
+			3: {Info: interfaceInfo{Name: "wg0", Index: 3, Type: "wireguard"}, Rules: allowRules{EnableV4: true, EnableV6: true}},
+		},
+		tmpRulesets: map[string]temporaryRuleset{
+			"client-b": {Owner: "client-b", Interfaces: []string{"wg0"}, Rules: allowRules{EnableV6: true}},
+			"client-a": {Owner: "client-a", Interfaces: []string{"wg0"}, Rules: allowRules{AllowedPorts: []portKey{{Dport: htons(53), Protocol: ipProtoUDP}}}},
 		},
 		set: true,
 	}
@@ -644,6 +787,9 @@ func TestPolicyManagerConfigSnapshotIncludesTemporaryRulesets(t *testing.T) {
 	if len(cfg.TemporaryRulesets[0].Policy.AllowedPorts) != 1 || !cfg.TemporaryRulesets[1].Policy.EnableV6 {
 		t.Fatalf("tmp ruleset policies = %+v", cfg.TemporaryRulesets)
 	}
+	if got := strings.Join(cfg.TemporaryRulesets[0].Interfaces, ", "); got != "wg0" {
+		t.Fatalf("tmp ruleset interfaces = %q", got)
+	}
 }
 
 func TestPolicyManagerConfigSnapshotIncludesForceActiveRulesets(t *testing.T) {
@@ -653,10 +799,10 @@ func TestPolicyManagerConfigSnapshotIncludesForceActiveRulesets(t *testing.T) {
 				{Name: "office", allowRules: allowRules{EnableV6: true}},
 			},
 		},
-		forceRulesets: map[string]map[string]int{
+		forceRulesets: map[string]map[string]map[string]int{
 			"office": {
-				"client-b": 1,
-				"client-a": 2,
+				"client-b": map[string]int{"wg0": 1},
+				"client-a": map[string]int{"wg0": 2},
 			},
 		},
 		set: true,
@@ -670,6 +816,9 @@ func TestPolicyManagerConfigSnapshotIncludesForceActiveRulesets(t *testing.T) {
 	if forced.Name != "office" || len(forced.Clients) != 2 || forced.Clients[0] != "client-a" || forced.Clients[1] != "client-b" {
 		t.Fatalf("force-active ruleset snapshot = %+v", forced)
 	}
+	if got := strings.Join(forced.Interfaces, ", "); got != "wg0" {
+		t.Fatalf("force-active interfaces = %q", got)
+	}
 }
 
 func TestPolicyManagerConfigSnapshotMarksActiveRuleset(t *testing.T) {
@@ -678,22 +827,21 @@ func TestPolicyManagerConfigSnapshotMarksActiveRuleset(t *testing.T) {
 			Rulesets: []ruleset{
 				{
 					Name:       "office",
-					Priority:   20,
 					Trigger:    rulesetTrigger{InterfaceNames: []string{"wg0"}},
 					allowRules: allowRules{EnableV4: true},
 				},
 				{
 					Name:       "home",
 					Disabled:   true,
-					Priority:   10,
 					Trigger:    rulesetTrigger{InterfaceNames: []string{"tun0"}},
 					allowRules: allowRules{EnableV6: true},
 				},
 			},
 		},
-		current:    allowRules{EnableV4: true},
-		activeName: "office",
-		set:        true,
+		current: map[int]interfacePolicy{
+			3: {Info: interfaceInfo{Name: "wg0", Index: 3, Type: "wireguard"}, Rules: allowRules{EnableV4: true}, ActiveRulesets: []string{"office"}},
+		},
+		set: true,
 	}
 
 	cfg := manager.configSnapshot()
@@ -720,7 +868,7 @@ func TestPolicyManagerConfigSnapshotMarksActiveRuleset(t *testing.T) {
 func TestAPIRulesetsNeverMarksDisabledRulesetActive(t *testing.T) {
 	rulesets := apiRulesets([]ruleset{
 		{Name: "office", Disabled: true, Trigger: rulesetTrigger{InterfaceNames: []string{"wg0"}}},
-	}, "office")
+	}, map[string]bool{"office": true})
 	if len(rulesets) != 1 || rulesets[0].Active || !rulesets[0].Disabled {
 		t.Fatalf("rulesets = %+v", rulesets)
 	}
@@ -790,7 +938,6 @@ func TestMutateOptionsSetsWholeRuleset(t *testing.T) {
 		Ruleset:   "office",
 		RulesetDef: &adminapi.RulesetMutation{
 			Disabled: true,
-			Priority: 20,
 			MatchAll: true,
 			Trigger: adminapi.RulesetTrigger{
 				InterfaceNames: []string{"wg0"},
@@ -806,7 +953,7 @@ func TestMutateOptionsSetsWholeRuleset(t *testing.T) {
 		t.Fatalf("rulesets = %+v", next.Rulesets)
 	}
 	ruleset := next.Rulesets[0]
-	if ruleset.Name != "office" || !ruleset.Disabled || ruleset.Priority != 20 || !ruleset.MatchAll || !ruleset.EnableV6 {
+	if ruleset.Name != "office" || !ruleset.Disabled || !ruleset.MatchAll || !ruleset.EnableV6 {
 		t.Fatalf("ruleset = %+v", ruleset)
 	}
 	if len(ruleset.Trigger.IPAddrs) != 1 || ruleset.Trigger.IPAddrs[0] != netipMustParse("10.64.0.2") {
@@ -820,9 +967,8 @@ func TestMutateOptionsAddsAndRemovesWholeRuleset(t *testing.T) {
 		Target:    "ruleset",
 		Ruleset:   "office",
 		RulesetDef: &adminapi.RulesetMutation{
-			Priority: 20,
-			Trigger:  adminapi.RulesetTrigger{InterfaceNames: []string{"wg0"}},
-			Policy:   adminapi.AllowRules{EnableV4: true},
+			Trigger: adminapi.RulesetTrigger{InterfaceNames: []string{"wg0"}},
+			Policy:  adminapi.AllowRules{EnableV4: true},
 		},
 	})
 	if err != nil {
@@ -851,7 +997,6 @@ func TestMutateOptionsSetsRulesetDisabled(t *testing.T) {
 		Rulesets: []ruleset{
 			{
 				Name:       "office",
-				Priority:   20,
 				Trigger:    rulesetTrigger{InterfaceNames: []string{"wg0"}},
 				allowRules: allowRules{EnableV6: true},
 			},
