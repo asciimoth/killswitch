@@ -109,6 +109,7 @@ type options struct {
 	IgnoredInterfaceTypes   []string
 	IgnoredInterfaceNames   []string
 	IgnoredInterfaceRegexps []string
+	AdminAPI                adminAPIOptions
 	allowRules
 	Rulesets []ruleset
 }
@@ -147,6 +148,7 @@ type configFile struct {
 	IgnoredInterfaceTypes   []string                 `json:"ignored_interface_types"`
 	IgnoredInterfaceNames   []string                 `json:"ignored_interface_names"`
 	IgnoredInterfaceRegexps []string                 `json:"ignored_interface_regexps"`
+	AdminAPI                adminAPIConfig           `json:"admin_api"`
 	AllowAll                bool                     `json:"allow_all"`
 	EnableV4                bool                     `json:"enable_v4"`
 	EnableV6                bool                     `json:"enable_v6"`
@@ -269,6 +271,7 @@ func configToOptions(cfg configFile) (options, error) {
 		IgnoredInterfaceTypes:   cfg.IgnoredInterfaceTypes,
 		IgnoredInterfaceNames:   cfg.IgnoredInterfaceNames,
 		IgnoredInterfaceRegexps: cfg.IgnoredInterfaceRegexps,
+		AdminAPI:                adminAPIOptionsFromConfig(cfg.AdminAPI),
 		allowRules: allowRules{
 			AllowAll: cfg.AllowAll,
 			EnableV4: cfg.EnableV4,
@@ -277,6 +280,9 @@ func configToOptions(cfg configFile) (options, error) {
 	}
 	if len(opts.InterfaceTypes) == 0 && len(opts.InterfaceNames) == 0 && len(opts.InterfaceRegexps) == 0 {
 		return options{}, errors.New("at least one interface_types, interface_names, or interface_regexps entry is required")
+	}
+	if err := validateAdminAPIOptions(opts.AdminAPI); err != nil {
+		return options{}, err
 	}
 
 	for _, pattern := range opts.InterfaceRegexps {
@@ -450,7 +456,7 @@ func run(parent context.Context, opts options) error {
 		_ = reader.Close()
 	}()
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() {
 		if err := readBootstrapEvents(reader); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
 			errCh <- err
@@ -462,6 +468,13 @@ func run(parent context.Context, opts options) error {
 
 	go func() {
 		if err := watchInterfaces(ctx, manager, policies); err != nil {
+			errCh <- err
+		}
+	}()
+
+	adminServer := newAdminAPIServer(opts.AdminAPI)
+	go func() {
+		if err := adminServer.listenAndServe(ctx); err != nil {
 			errCh <- err
 		}
 	}()

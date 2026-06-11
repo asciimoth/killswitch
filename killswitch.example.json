@@ -18,6 +18,14 @@
   "ignored_interface_regexps": [
     "^(veth|br-)"
   ],
+  "admin_api": {
+    "socket_path": "/run/killswitch/admin.sock",
+    "auth": {
+      "groupnames": [
+        "killswitch"
+      ]
+    }
+  },
   "rulesets": {
     "wireguard-up": {
       "priority": 100,
