@@ -1,0 +1,264 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+
+	"github.com/asciimoth/killswitch/internal/adminapi"
+)
+
+func TestParseArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "empty", want: ""},
+		{name: "positional", args: []string{"/tmp/killswitch-user.json"}, want: "/tmp/killswitch-user.json"},
+		{name: "config flag", args: []string{"-config", "/tmp/flag.json"}, want: "/tmp/flag.json"},
+		{name: "short flag", args: []string{"-c", "/tmp/short.json"}, want: "/tmp/short.json"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseArgs(tt.args)
+			if err != nil {
+				t.Fatalf("parse args: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("config path = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseArgsRejectsAmbiguousConfigPath(t *testing.T) {
+	if _, err := parseArgs([]string{"-config", "/tmp/flag.json", "/tmp/positional.json"}); err == nil {
+		t.Fatal("parse args succeeded, expected error")
+	}
+}
+
+func TestDefaultConfigPath(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "xdg",
+			env:  map[string]string{"XDG_CONFIG_HOME": "/tmp/xdg", "HOME": "/home/alice", "USER": "alice"},
+			want: "/tmp/xdg/killswitch/killswitch-user.json",
+		},
+		{
+			name: "home",
+			env:  map[string]string{"HOME": "/home/alice", "USER": "alice"},
+			want: "/home/alice/.config/killswitch/killswitch-user.json",
+		},
+		{
+			name: "user",
+			env:  map[string]string{"USER": "alice"},
+			want: "/home/alice/.config/killswitch/killswitch-user.json",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := defaultConfigPath(mapEnv(tt.env))
+			if got != tt.want {
+				t.Fatalf("default config path = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadOptionsCreatesDefaultConfig(t *testing.T) {
+	xdgConfigHome := t.TempDir()
+
+	opts, err := loadOptions("", mapEnv(map[string]string{"XDG_CONFIG_HOME": xdgConfigHome}))
+	if err != nil {
+		t.Fatalf("load options: %v", err)
+	}
+
+	wantPath := filepath.Join(xdgConfigHome, "killswitch", defaultConfigFileName)
+	if opts.ConfigPath != wantPath {
+		t.Fatalf("config path = %q, want %q", opts.ConfigPath, wantPath)
+	}
+	if opts.SocketPath != adminapi.DefaultSocketPath {
+		t.Fatalf("socket path = %q, want %q", opts.SocketPath, adminapi.DefaultSocketPath)
+	}
+
+	info, err := os.Stat(wantPath)
+	if err != nil {
+		t.Fatalf("stat default config: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("default config mode = %v, want 0600", info.Mode().Perm())
+	}
+
+	cfg, err := readConfigFile(wantPath)
+	if err != nil {
+		t.Fatalf("read default config: %v", err)
+	}
+	if cfg.SocketPath != adminapi.DefaultSocketPath {
+		t.Fatalf("default config socket path = %q", cfg.SocketPath)
+	}
+}
+
+func TestLoadOptionsRejectsGroupWritableConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "killswitch-user.json")
+	if err := os.WriteFile(configPath, []byte(`{"socket_path":"/run/killswitch/admin.sock"}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := os.Chmod(configPath, 0o620); err != nil {
+		t.Fatalf("chmod config: %v", err)
+	}
+
+	if _, err := loadOptions(configPath, mapEnv(nil)); err == nil {
+		t.Fatal("load options succeeded, expected insecure config error")
+	}
+}
+
+func TestLoadOptionsRejectsRelativeSocketPath(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "killswitch-user.json")
+	if err := os.WriteFile(configPath, []byte(`{"socket_path":"relative.sock"}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if _, err := loadOptions(configPath, mapEnv(nil)); err == nil {
+		t.Fatal("load options succeeded, expected relative socket path error")
+	}
+}
+
+func TestReadConfigFileRejectsUnknownFieldsAndMultipleValues(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "unknown field", data: `{"socket_path":"/tmp/admin.sock","unknown":true}`},
+		{name: "multiple values", data: `{"socket_path":"/tmp/admin.sock"} {}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "killswitch-user.json")
+			if err := os.WriteFile(configPath, []byte(tt.data), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if _, err := readConfigFile(configPath); err == nil {
+				t.Fatal("read config succeeded, expected error")
+			}
+		})
+	}
+}
+
+func TestRunClientSubscribesAllEventsAndNotifies(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close() //nolint:errcheck
+
+	ctx, cancel := context.WithCancel(context.Background())
+	notifications := &recordingNotifier{cancel: cancel}
+	client := adminapi.NewClient(clientConn)
+
+	serverErr := make(chan error, 1)
+	go func() {
+		decoder := json.NewDecoder(serverConn)
+		msg, err := adminapi.ReadMessage(decoder)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		subscribe, ok := msg.(adminapi.SubscribeRequest)
+		if !ok {
+			serverErr <- errors.New("first message was not subscribe")
+			return
+		}
+		wantEventTypes := []adminapi.EventType{
+			adminapi.EventTypeConfig,
+			adminapi.EventTypeInterfaces,
+			adminapi.EventTypeClients,
+			adminapi.EventTypeNotification,
+		}
+		if !reflect.DeepEqual(subscribe.EventTypes, wantEventTypes) {
+			serverErr <- errors.New("unexpected event types")
+			return
+		}
+
+		encoder := json.NewEncoder(serverConn)
+		if err := adminapi.WriteMessage(encoder, adminapi.EventMessage{EventType: adminapi.EventTypeInterfaces}); err != nil {
+			serverErr <- err
+			return
+		}
+		if err := adminapi.WriteMessage(encoder, adminapi.EventMessage{
+			EventType: adminapi.EventTypeNotification,
+			Notification: adminapi.Notification{
+				Level:  adminapi.NotificationLevelWarn,
+				Header: "Network blocked",
+				Text:   "egress policy blocked a packet",
+			},
+		}); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	if err := runClient(ctx, client, notifications); err != nil {
+		t.Fatalf("run client: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+
+	if len(notifications.notifications) != 1 {
+		t.Fatalf("notifications = %+v", notifications.notifications)
+	}
+	if notifications.notifications[0].Header != "Network blocked" {
+		t.Fatalf("notification = %+v", notifications.notifications[0])
+	}
+}
+
+func TestNotificationTitle(t *testing.T) {
+	tests := []struct {
+		name         string
+		notification adminapi.Notification
+		want         string
+	}{
+		{name: "header", notification: adminapi.Notification{Header: "Custom"}, want: "Killswitch: Custom"},
+		{name: "normal", notification: adminapi.Notification{Level: adminapi.NotificationLevelNormal}, want: "Killswitch"},
+		{name: "warn", notification: adminapi.Notification{Level: adminapi.NotificationLevelWarn}, want: "Killswitch warning"},
+		{name: "error", notification: adminapi.Notification{Level: adminapi.NotificationLevelError}, want: "Killswitch error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := notificationTitle(tt.notification); got != tt.want {
+				t.Fatalf("title = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+type recordingNotifier struct {
+	notifications []adminapi.Notification
+	cancel        context.CancelFunc
+}
+
+func (n *recordingNotifier) Notify(notification adminapi.Notification) error {
+	n.notifications = append(n.notifications, notification)
+	if n.cancel != nil {
+		n.cancel()
+	}
+	return nil
+}
+
+func mapEnv(values map[string]string) envLookup {
+	return func(key string) string {
+		return values[key]
+	}
+}

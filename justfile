@@ -13,6 +13,9 @@ build: generate
 daemon: build
   sudo ./killswitch ./killswitch.example.json
 
+user: build
+  ./killswitch-user ./killswitch-user.example.json
+
 get-cfg: build
   ./killswitch-cli get-cfg --watch
 
