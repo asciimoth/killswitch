@@ -4,6 +4,7 @@ package main
 
 import (
 	"net"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -97,6 +98,59 @@ func TestConfigToOptions(t *testing.T) {
 	}
 
 	assertParsedOptions(t, opts)
+}
+
+func TestConfigToOptionsParsesRulesets(t *testing.T) {
+	opts, err := configToOptions(configFile{
+		InterfaceNames: []string{"eth0"},
+		EnableV4:       true,
+		AllowedPorts:   []string{"tcp/443"},
+		Rulesets: map[string]rulesetConfig{
+			"office": {
+				Priority:       20,
+				Match:          "and",
+				Trigger:        triggerConfig{InterfaceNames: []string{"wg0"}, IPAddrs: []string{"10.64.0.2"}},
+				EnableV6:       true,
+				AllowedV4Hosts: []string{"192.0.2.10"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("config to options: %v", err)
+	}
+
+	if len(opts.Rulesets) != 1 {
+		t.Fatalf("rulesets count = %d", len(opts.Rulesets))
+	}
+	ruleset := opts.Rulesets[0]
+	if ruleset.Name != "office" || ruleset.Priority != 20 || !ruleset.MatchAll {
+		t.Fatalf("unexpected ruleset metadata: %+v", ruleset)
+	}
+	if len(ruleset.Trigger.InterfaceNames) != 1 || ruleset.Trigger.InterfaceNames[0] != "wg0" {
+		t.Fatalf("unexpected interface trigger: %+v", ruleset.Trigger)
+	}
+	if len(ruleset.Trigger.IPAddrs) != 1 || ruleset.Trigger.IPAddrs[0] != netipMustParse("10.64.0.2") {
+		t.Fatalf("unexpected ip trigger: %+v", ruleset.Trigger.IPAddrs)
+	}
+	if !ruleset.EnableV6 || len(ruleset.AllowedV4Hosts) != 1 {
+		t.Fatalf("unexpected ruleset rules: %+v", ruleset.allowRules)
+	}
+}
+
+func TestConfigToOptionsRejectsInvalidRulesets(t *testing.T) {
+	tests := []configFile{
+		{InterfaceNames: []string{"eth0"}, Rulesets: map[string]rulesetConfig{"": {Trigger: triggerConfig{InterfaceNames: []string{"wg0"}}}}},
+		{InterfaceNames: []string{"eth0"}, Rulesets: map[string]rulesetConfig{"vpn": {Match: "xor", Trigger: triggerConfig{InterfaceNames: []string{"wg0"}}}}},
+		{InterfaceNames: []string{"eth0"}, Rulesets: map[string]rulesetConfig{"vpn": {}}},
+		{InterfaceNames: []string{"eth0"}, Rulesets: map[string]rulesetConfig{"vpn": {Trigger: triggerConfig{InterfaceRegexps: []string{"["}}}}},
+		{InterfaceNames: []string{"eth0"}, Rulesets: map[string]rulesetConfig{"vpn": {Trigger: triggerConfig{IPAddrs: []string{"not-an-ip"}}}}},
+	}
+
+	for _, cfg := range tests {
+		if _, err := configToOptions(cfg); err == nil {
+			t.Fatalf("configToOptions(%+v) succeeded, expected error", cfg)
+		}
+	}
 }
 
 func assertParsedOptions(t *testing.T, opts options) {
@@ -257,6 +311,99 @@ func TestSelectInterfacesIgnoreRulesOverrideIncludes(t *testing.T) {
 	}
 }
 
+func TestActiveRulesetSelectsHighestPriorityCandidate(t *testing.T) {
+	all := []interfaceInfo{
+		{Name: "eth0", Index: 2, Type: "device", Addrs: []netip.Addr{netipMustParse("192.0.2.44")}},
+		{Name: "wg0", Index: 3, Type: "wireguard", Addrs: []netip.Addr{netipMustParse("10.64.0.2")}},
+	}
+	rulesets := []ruleset{
+		{Name: "low", Priority: 10, Trigger: rulesetTrigger{InterfaceTypes: []string{"device"}}},
+		{Name: "high", Priority: 50, Trigger: rulesetTrigger{InterfaceRegexps: []string{"^wg"}}},
+		{Name: "inactive", Priority: 100, Trigger: rulesetTrigger{InterfaceNames: []string{"tun0"}}},
+	}
+
+	active := activeRuleset(all, rulesets)
+	if active == nil || active.Name != "high" {
+		t.Fatalf("active ruleset = %+v", active)
+	}
+}
+
+func TestRulesetTriggerANDRequiresAllTriggers(t *testing.T) {
+	all := []interfaceInfo{
+		{Name: "wg0", Index: 3, Type: "wireguard", Addrs: []netip.Addr{netipMustParse("10.64.0.2")}},
+	}
+	trigger := rulesetTrigger{
+		InterfaceNames: []string{"wg0"},
+		IPAddrs:        []netip.Addr{netipMustParse("10.64.0.2")},
+	}
+	if !rulesetTriggerMatches(all, trigger, true) {
+		t.Fatal("expected AND trigger to match when all predicates are present")
+	}
+
+	trigger.IPAddrs = []netip.Addr{netipMustParse("10.64.0.3")}
+	if rulesetTriggerMatches(all, trigger, true) {
+		t.Fatal("expected AND trigger to miss when one predicate is absent")
+	}
+	if !rulesetTriggerMatches(all, trigger, false) {
+		t.Fatal("expected OR trigger to match when one predicate is present")
+	}
+}
+
+func TestMergeAllowRulesAllowsEitherSide(t *testing.T) {
+	base := allowRules{
+		EnableV4:       true,
+		AllowedMarks:   []uint32{0x42},
+		AllowedPorts:   []portKey{{Dport: htons(443), Protocol: ipProtoTCP}},
+		AllowedV4Hosts: []uint32{ipv4Key(netipMustParse("192.0.2.10"))},
+	}
+	overlay := allowRules{
+		EnableV6:       true,
+		AllowedMarks:   []uint32{0x42, 0x43},
+		AllowedPorts:   []portKey{{Dport: htons(443), Protocol: ipProtoTCP}, {Dport: htons(51820), Protocol: ipProtoUDP}},
+		AllowedV6Hosts: []ipv6AddrKey{ipv6Key(netipMustParse("2001:db8::10"))},
+	}
+
+	merged := mergeAllowRules(base, overlay)
+	if !merged.EnableV4 || !merged.EnableV6 {
+		t.Fatalf("unexpected merged gates: %+v", merged)
+	}
+	if len(merged.AllowedMarks) != 2 {
+		t.Fatalf("unexpected merged marks: %+v", merged.AllowedMarks)
+	}
+	if len(merged.AllowedPorts) != 2 {
+		t.Fatalf("unexpected merged ports: %+v", merged.AllowedPorts)
+	}
+	if len(merged.AllowedV4Hosts) != 1 || len(merged.AllowedV6Hosts) != 1 {
+		t.Fatalf("unexpected merged hosts: %+v", merged)
+	}
+}
+
+func TestPolicyManagerSkipsUnchangedEffectiveRules(t *testing.T) {
+	manager := &policyManager{
+		opts: options{
+			allowRules: allowRules{EnableV4: true},
+			Rulesets: []ruleset{
+				{
+					Name:       "same",
+					Priority:   10,
+					Trigger:    rulesetTrigger{InterfaceNames: []string{"wg0"}},
+					allowRules: allowRules{EnableV4: true},
+				},
+			},
+		},
+		current: allowRules{EnableV4: true},
+		set:     true,
+	}
+
+	changed, err := manager.reconcile([]interfaceInfo{{Name: "wg0", Type: "wireguard"}}, true)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if changed {
+		t.Fatal("expected unchanged effective policy to be skipped")
+	}
+}
+
 func TestShouldReconcileLinkUpdateIgnoresUnchangedSelectedInterface(t *testing.T) {
 	manager := newEgressManager(nil)
 	manager.attached[4] = attachedInterface{info: interfaceInfo{Name: "wlp0s20f3", Index: 4, Type: "device"}}
@@ -377,6 +524,14 @@ func ipv6Bytes(t *testing.T, value string) [16]byte {
 	var out [16]byte
 	copy(out[:], parsed)
 	return out
+}
+
+func netipMustParse(value string) netip.Addr {
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		panic(err)
+	}
+	return addr
 }
 
 func linkUpdate(msgType uint16, index int, name string, typ string) netlink.LinkUpdate {

@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -108,39 +109,84 @@ type options struct {
 	IgnoredInterfaceTypes   []string
 	IgnoredInterfaceNames   []string
 	IgnoredInterfaceRegexps []string
-	AllowAll                bool
-	EnableV4                bool
-	EnableV6                bool
-	AllowedMarks            []uint32
-	AllowedPorts            []portKey
-	AllowedV4Hosts          []uint32
-	AllowedV6Hosts          []ipv6AddrKey
-	AllowedV4Pairs          []hostport4Key
-	AllowedV6Pairs          []hostport6Key
+	allowRules
+	Rulesets []ruleset
+}
+
+type allowRules struct {
+	AllowAll       bool
+	EnableV4       bool
+	EnableV6       bool
+	AllowedMarks   []uint32
+	AllowedPorts   []portKey
+	AllowedV4Hosts []uint32
+	AllowedV6Hosts []ipv6AddrKey
+	AllowedV4Pairs []hostport4Key
+	AllowedV6Pairs []hostport6Key
+}
+
+type ruleset struct {
+	Name     string
+	Priority int
+	MatchAll bool
+	Trigger  rulesetTrigger
+	allowRules
+}
+
+type rulesetTrigger struct {
+	InterfaceTypes   []string
+	InterfaceNames   []string
+	InterfaceRegexps []string
+	IPAddrs          []netip.Addr
 }
 
 type configFile struct {
-	InterfaceTypes          []string `json:"interface_types"`
-	InterfaceNames          []string `json:"interface_names"`
-	InterfaceRegexps        []string `json:"interface_regexps"`
-	IgnoredInterfaceTypes   []string `json:"ignored_interface_types"`
-	IgnoredInterfaceNames   []string `json:"ignored_interface_names"`
-	IgnoredInterfaceRegexps []string `json:"ignored_interface_regexps"`
-	AllowAll                bool     `json:"allow_all"`
-	EnableV4                bool     `json:"enable_v4"`
-	EnableV6                bool     `json:"enable_v6"`
-	AllowedMarks            []string `json:"allowed_marks"`
-	AllowedPorts            []string `json:"allowed_ports"`
-	AllowedV4Hosts          []string `json:"allowed_v4_hosts"`
-	AllowedV6Hosts          []string `json:"allowed_v6_hosts"`
-	AllowedV4Pairs          []string `json:"allowed_v4_hostports"`
-	AllowedV6Pairs          []string `json:"allowed_v6_hostports"`
+	InterfaceTypes          []string                 `json:"interface_types"`
+	InterfaceNames          []string                 `json:"interface_names"`
+	InterfaceRegexps        []string                 `json:"interface_regexps"`
+	IgnoredInterfaceTypes   []string                 `json:"ignored_interface_types"`
+	IgnoredInterfaceNames   []string                 `json:"ignored_interface_names"`
+	IgnoredInterfaceRegexps []string                 `json:"ignored_interface_regexps"`
+	AllowAll                bool                     `json:"allow_all"`
+	EnableV4                bool                     `json:"enable_v4"`
+	EnableV6                bool                     `json:"enable_v6"`
+	AllowedMarks            []string                 `json:"allowed_marks"`
+	AllowedPorts            []string                 `json:"allowed_ports"`
+	AllowedV4Hosts          []string                 `json:"allowed_v4_hosts"`
+	AllowedV6Hosts          []string                 `json:"allowed_v6_hosts"`
+	AllowedV4Pairs          []string                 `json:"allowed_v4_hostports"`
+	AllowedV6Pairs          []string                 `json:"allowed_v6_hostports"`
+	Rulesets                map[string]rulesetConfig `json:"rulesets"`
+}
+
+type rulesetConfig struct {
+	Priority       int           `json:"priority"`
+	Match          string        `json:"match"`
+	MatchAll       bool          `json:"match_all"`
+	Trigger        triggerConfig `json:"trigger"`
+	AllowAll       bool          `json:"allow_all"`
+	EnableV4       bool          `json:"enable_v4"`
+	EnableV6       bool          `json:"enable_v6"`
+	AllowedMarks   []string      `json:"allowed_marks"`
+	AllowedPorts   []string      `json:"allowed_ports"`
+	AllowedV4Hosts []string      `json:"allowed_v4_hosts"`
+	AllowedV6Hosts []string      `json:"allowed_v6_hosts"`
+	AllowedV4Pairs []string      `json:"allowed_v4_hostports"`
+	AllowedV6Pairs []string      `json:"allowed_v6_hostports"`
+}
+
+type triggerConfig struct {
+	InterfaceTypes   []string `json:"interface_types"`
+	InterfaceNames   []string `json:"interface_names"`
+	InterfaceRegexps []string `json:"interface_regexps"`
+	IPAddrs          []string `json:"ip_addrs"`
 }
 
 type interfaceInfo struct {
 	Index int
 	Name  string
 	Type  string
+	Addrs []netip.Addr
 }
 
 type attachedInterface struct {
@@ -151,6 +197,13 @@ type attachedInterface struct {
 type egressManager struct {
 	program  *ebpf.Program
 	attached map[int]attachedInterface
+}
+
+type policyManager struct {
+	objs    *killswitchObjects
+	opts    options
+	current allowRules
+	set     bool
 }
 
 func main() {
@@ -216,9 +269,11 @@ func configToOptions(cfg configFile) (options, error) {
 		IgnoredInterfaceTypes:   cfg.IgnoredInterfaceTypes,
 		IgnoredInterfaceNames:   cfg.IgnoredInterfaceNames,
 		IgnoredInterfaceRegexps: cfg.IgnoredInterfaceRegexps,
-		AllowAll:                cfg.AllowAll,
-		EnableV4:                cfg.EnableV4,
-		EnableV6:                cfg.EnableV6,
+		allowRules: allowRules{
+			AllowAll: cfg.AllowAll,
+			EnableV4: cfg.EnableV4,
+			EnableV6: cfg.EnableV6,
+		},
 	}
 	if len(opts.InterfaceTypes) == 0 && len(opts.InterfaceNames) == 0 && len(opts.InterfaceRegexps) == 0 {
 		return options{}, errors.New("at least one interface_types, interface_names, or interface_regexps entry is required")
@@ -253,15 +308,117 @@ func configToOptions(cfg configFile) (options, error) {
 	if opts.AllowedV6Pairs, err = allowedV6HostportKeys(cfg.AllowedV6Pairs); err != nil {
 		return options{}, err
 	}
+	if opts.Rulesets, err = rulesetsFromConfig(cfg.Rulesets); err != nil {
+		return options{}, err
+	}
 
 	return opts, nil
 }
 
-func run(parent context.Context, opts options) error {
-	if opts.AllowAll {
-		log.Print("WARNING: AllowAll is enabled; protected interfaces will pass all traffic")
+func rulesetsFromConfig(configs map[string]rulesetConfig) ([]ruleset, error) {
+	rulesets := make([]ruleset, 0, len(configs))
+	names := make([]string, 0, len(configs))
+	for name := range configs {
+		if name == "" {
+			return nil, errors.New("ruleset name is required")
+		}
+		names = append(names, name)
 	}
+	sort.Strings(names)
 
+	for _, name := range names {
+		cfg := configs[name]
+
+		matchAll, err := parseRulesetMatch(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("ruleset %q: %w", name, err)
+		}
+
+		trigger, err := triggerFromConfig(cfg.Trigger)
+		if err != nil {
+			return nil, fmt.Errorf("ruleset %q: %w", name, err)
+		}
+
+		rules, err := allowRulesFromConfig(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("ruleset %q: %w", name, err)
+		}
+
+		rulesets = append(rulesets, ruleset{
+			Name:       name,
+			Priority:   cfg.Priority,
+			MatchAll:   matchAll,
+			Trigger:    trigger,
+			allowRules: rules,
+		})
+	}
+	return rulesets, nil
+}
+
+func parseRulesetMatch(cfg rulesetConfig) (bool, error) {
+	switch strings.ToLower(cfg.Match) {
+	case "", "or":
+		return cfg.MatchAll, nil
+	case "and":
+		return true, nil
+	default:
+		return false, fmt.Errorf("match must be \"and\" or \"or\", got %q", cfg.Match)
+	}
+}
+
+func triggerFromConfig(cfg triggerConfig) (rulesetTrigger, error) {
+	trigger := rulesetTrigger{
+		InterfaceTypes:   cfg.InterfaceTypes,
+		InterfaceNames:   cfg.InterfaceNames,
+		InterfaceRegexps: cfg.InterfaceRegexps,
+	}
+	for _, pattern := range trigger.InterfaceRegexps {
+		if _, err := regexp.Compile(pattern); err != nil {
+			return rulesetTrigger{}, fmt.Errorf("compile trigger interface regexp %q: %w", pattern, err)
+		}
+	}
+	for _, value := range cfg.IPAddrs {
+		addr, err := netip.ParseAddr(value)
+		if err != nil {
+			return rulesetTrigger{}, fmt.Errorf("parse trigger ip_addrs %q: %w", value, err)
+		}
+		trigger.IPAddrs = append(trigger.IPAddrs, addr.Unmap())
+	}
+	if len(trigger.InterfaceTypes) == 0 && len(trigger.InterfaceNames) == 0 && len(trigger.InterfaceRegexps) == 0 && len(trigger.IPAddrs) == 0 {
+		return rulesetTrigger{}, errors.New("trigger requires at least one interface_types, interface_names, interface_regexps, or ip_addrs entry")
+	}
+	return trigger, nil
+}
+
+func allowRulesFromConfig(cfg rulesetConfig) (allowRules, error) {
+	rules := allowRules{
+		AllowAll: cfg.AllowAll,
+		EnableV4: cfg.EnableV4,
+		EnableV6: cfg.EnableV6,
+	}
+	var err error
+	if rules.AllowedMarks, err = policy.ParseAllowedMarks(cfg.AllowedMarks); err != nil {
+		return allowRules{}, err
+	}
+	if rules.AllowedPorts, err = allowedPortKeys(cfg.AllowedPorts); err != nil {
+		return allowRules{}, err
+	}
+	if rules.AllowedV4Hosts, err = allowedV4HostKeys(cfg.AllowedV4Hosts); err != nil {
+		return allowRules{}, err
+	}
+	if rules.AllowedV6Hosts, err = allowedV6HostKeys(cfg.AllowedV6Hosts); err != nil {
+		return allowRules{}, err
+	}
+	if rules.AllowedV4Pairs, err = allowedV4HostportKeys(cfg.AllowedV4Pairs); err != nil {
+		return allowRules{}, err
+	}
+	if rules.AllowedV6Pairs, err = allowedV6HostportKeys(cfg.AllowedV6Pairs); err != nil {
+		return allowRules{}, err
+	}
+	return rules, nil
+}
+
+func run(parent context.Context, opts options) error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("remove memlock rlimit: %w", err)
 	}
@@ -272,14 +429,8 @@ func run(parent context.Context, opts options) error {
 	}
 	defer objs.Close() //nolint:errcheck
 
-	if err := writeRuntimeConfig(objs.RuntimeConfig, runtimeConfig{
-		AllowAll: boolByte(opts.AllowAll),
-		EnableV4: boolByte(opts.EnableV4),
-		EnableV6: boolByte(opts.EnableV6),
-	}); err != nil {
-		return err
-	}
-	if err := writeAllowlists(&objs, opts); err != nil {
+	policies := newPolicyManager(&objs, opts)
+	if _, err := policies.reconcileCurrent(true); err != nil {
 		return err
 	}
 
@@ -299,16 +450,6 @@ func run(parent context.Context, opts options) error {
 		_ = reader.Close()
 	}()
 
-	log.Printf("Runtime config: allow_all=%t enable_v4=%t enable_v6=%t", opts.AllowAll, opts.EnableV4, opts.EnableV6)
-	log.Printf("Allowlists: marks=%d ports=%d v4_hosts=%d v6_hosts=%d v4_hostports=%d v6_hostports=%d",
-		len(opts.AllowedMarks),
-		len(opts.AllowedPorts),
-		len(opts.AllowedV4Hosts),
-		len(opts.AllowedV6Hosts),
-		len(opts.AllowedV4Pairs),
-		len(opts.AllowedV6Pairs),
-	)
-
 	errCh := make(chan error, 2)
 	go func() {
 		if err := readBootstrapEvents(reader); err != nil && !errors.Is(err, ringbuf.ErrClosed) {
@@ -320,7 +461,7 @@ func run(parent context.Context, opts options) error {
 	defer manager.close()
 
 	go func() {
-		if err := watchInterfaces(ctx, manager, opts); err != nil {
+		if err := watchInterfaces(ctx, manager, policies); err != nil {
 			errCh <- err
 		}
 	}()
@@ -354,13 +495,53 @@ func listInterfaces() ([]interfaceInfo, error) {
 		if attrs == nil {
 			continue
 		}
+		addrs, err := interfaceAddrs(l)
+		if err != nil {
+			return nil, err
+		}
 		all = append(all, interfaceInfo{
 			Index: attrs.Index,
 			Name:  attrs.Name,
 			Type:  l.Type(),
+			Addrs: addrs,
 		})
 	}
 	return all, nil
+}
+
+func interfaceAddrs(link netlink.Link) ([]netip.Addr, error) {
+	addrList, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		attrs := link.Attrs()
+		if attrs != nil {
+			return nil, fmt.Errorf("list addresses for %s(index %d): %w", attrs.Name, attrs.Index, err)
+		}
+		return nil, fmt.Errorf("list addresses: %w", err)
+	}
+
+	addrs := make([]netip.Addr, 0, len(addrList))
+	for _, addr := range addrList {
+		parsed, ok := netipAddrFromIP(addr.IP)
+		if ok {
+			addrs = append(addrs, parsed)
+		}
+	}
+	sort.Slice(addrs, func(i, j int) bool {
+		return addrs[i].Less(addrs[j])
+	})
+	return addrs, nil
+}
+
+func netipAddrFromIP(ip net.IP) (netip.Addr, bool) {
+	if v4 := ip.To4(); v4 != nil {
+		addr, ok := netip.AddrFromSlice(v4)
+		return addr.Unmap(), ok
+	}
+	if v6 := ip.To16(); v6 != nil {
+		addr, ok := netip.AddrFromSlice(v6)
+		return addr.Unmap(), ok
+	}
+	return netip.Addr{}, false
 }
 
 func selectInterfaces(all []interfaceInfo, opts options) ([]interfaceInfo, error) {
@@ -381,6 +562,129 @@ func selectInterfaces(all []interfaceInfo, opts options) ([]interfaceInfo, error
 	return selected, nil
 }
 
+func newPolicyManager(objs *killswitchObjects, opts options) *policyManager {
+	return &policyManager{objs: objs, opts: opts}
+}
+
+func (m *policyManager) reconcileCurrent(logChange bool) (bool, error) {
+	all, err := listInterfaces()
+	if err != nil {
+		return false, fmt.Errorf("list interfaces: %w", err)
+	}
+	return m.reconcile(all, logChange)
+}
+
+func (m *policyManager) reconcile(all []interfaceInfo, logChange bool) (bool, error) {
+	active := activeRuleset(all, m.opts.Rulesets)
+	effective := m.opts.allowRules
+	activeName := ""
+	if active != nil {
+		effective = mergeAllowRules(effective, active.allowRules)
+		activeName = active.Name
+	}
+	effective = canonicalAllowRules(effective)
+
+	if m.set && allowRulesEqual(m.current, effective) {
+		return false, nil
+	}
+
+	if err := writeEffectivePolicy(m.objs, effective); err != nil {
+		return false, err
+	}
+	m.current = effective
+	m.set = true
+	if logChange {
+		logPolicy(activeName, effective)
+	}
+	return true, nil
+}
+
+func activeRuleset(all []interfaceInfo, rulesets []ruleset) *ruleset {
+	var active *ruleset
+	for i := range rulesets {
+		ruleset := &rulesets[i]
+		if !rulesetTriggerMatches(all, ruleset.Trigger, ruleset.MatchAll) {
+			continue
+		}
+		if active == nil || ruleset.Priority > active.Priority || (ruleset.Priority == active.Priority && ruleset.Name < active.Name) {
+			active = ruleset
+		}
+	}
+	return active
+}
+
+func rulesetTriggerMatches(all []interfaceInfo, trigger rulesetTrigger, matchAll bool) bool {
+	total := len(trigger.InterfaceTypes) + len(trigger.InterfaceNames) + len(trigger.InterfaceRegexps) + len(trigger.IPAddrs)
+	if total == 0 {
+		return false
+	}
+
+	matched := 0
+	for _, typ := range trigger.InterfaceTypes {
+		if systemHasInterfaceType(all, typ) {
+			matched++
+		}
+	}
+	for _, name := range trigger.InterfaceNames {
+		if systemHasInterfaceName(all, name) {
+			matched++
+		}
+	}
+	for _, pattern := range trigger.InterfaceRegexps {
+		if systemHasInterfaceRegexp(all, pattern) {
+			matched++
+		}
+	}
+	for _, addr := range trigger.IPAddrs {
+		if systemHasIPAddr(all, addr) {
+			matched++
+		}
+	}
+	if matchAll {
+		return matched == total
+	}
+	return matched > 0
+}
+
+func systemHasInterfaceType(all []interfaceInfo, typ string) bool {
+	for _, iface := range all {
+		if iface.Type == typ {
+			return true
+		}
+	}
+	return false
+}
+
+func systemHasInterfaceName(all []interfaceInfo, name string) bool {
+	for _, iface := range all {
+		if iface.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func systemHasInterfaceRegexp(all []interfaceInfo, pattern string) bool {
+	for _, iface := range all {
+		if regexp.MustCompile(pattern).MatchString(iface.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func systemHasIPAddr(all []interfaceInfo, addr netip.Addr) bool {
+	addr = addr.Unmap()
+	for _, iface := range all {
+		for _, ifaceAddr := range iface.Addrs {
+			if ifaceAddr.Unmap() == addr {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func writeRuntimeConfig(m *ebpf.Map, config runtimeConfig) error {
 	var key uint32
 	if err := m.Update(key, config, ebpf.UpdateAny); err != nil {
@@ -389,23 +693,77 @@ func writeRuntimeConfig(m *ebpf.Map, config runtimeConfig) error {
 	return nil
 }
 
-func writeAllowlists(objs *killswitchObjects, opts options) error {
-	if err := writeAllowedMarks(objs.AllowedMarks, opts.AllowedMarks); err != nil {
+func writeEffectivePolicy(objs *killswitchObjects, rules allowRules) error {
+	if err := clearAllowlists(objs); err != nil {
 		return err
 	}
-	if err := writeAllowedMap(objs.AllowedPorts, opts.AllowedPorts, "allowed_ports"); err != nil {
+	if err := writeAllowlists(objs, rules); err != nil {
 		return err
 	}
-	if err := writeAllowedMap(objs.AllowedV4Hosts, opts.AllowedV4Hosts, "allowed_v4_hosts"); err != nil {
+	if err := writeRuntimeConfig(objs.RuntimeConfig, runtimeConfig{
+		AllowAll: boolByte(rules.AllowAll),
+		EnableV4: boolByte(rules.EnableV4),
+		EnableV6: boolByte(rules.EnableV6),
+	}); err != nil {
 		return err
 	}
-	if err := writeAllowedMap(objs.AllowedV6Hosts, opts.AllowedV6Hosts, "allowed_v6_hosts"); err != nil {
+	return nil
+}
+
+func clearAllowlists(objs *killswitchObjects) error {
+	if err := clearAllowedMap[uint32](objs.AllowedMarks, "allowed_marks"); err != nil {
 		return err
 	}
-	if err := writeAllowedMap(objs.AllowedV4Hostports, opts.AllowedV4Pairs, "allowed_v4_hostports"); err != nil {
+	if err := clearAllowedMap[portKey](objs.AllowedPorts, "allowed_ports"); err != nil {
 		return err
 	}
-	if err := writeAllowedMap(objs.AllowedV6Hostports, opts.AllowedV6Pairs, "allowed_v6_hostports"); err != nil {
+	if err := clearAllowedMap[uint32](objs.AllowedV4Hosts, "allowed_v4_hosts"); err != nil {
+		return err
+	}
+	if err := clearAllowedMap[ipv6AddrKey](objs.AllowedV6Hosts, "allowed_v6_hosts"); err != nil {
+		return err
+	}
+	if err := clearAllowedMap[hostport4Key](objs.AllowedV4Hostports, "allowed_v4_hostports"); err != nil {
+		return err
+	}
+	if err := clearAllowedMap[hostport6Key](objs.AllowedV6Hostports, "allowed_v6_hostports"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func clearAllowedMap[K comparable](m *ebpf.Map, name string) error {
+	var key K
+	var value uint8
+	entries := m.Iterate()
+	for entries.Next(&key, &value) {
+		if err := m.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("delete %s map entry: %w", name, err)
+		}
+	}
+	if err := entries.Err(); err != nil {
+		return fmt.Errorf("iterate %s map: %w", name, err)
+	}
+	return nil
+}
+
+func writeAllowlists(objs *killswitchObjects, rules allowRules) error {
+	if err := writeAllowedMarks(objs.AllowedMarks, rules.AllowedMarks); err != nil {
+		return err
+	}
+	if err := writeAllowedMap(objs.AllowedPorts, rules.AllowedPorts, "allowed_ports"); err != nil {
+		return err
+	}
+	if err := writeAllowedMap(objs.AllowedV4Hosts, rules.AllowedV4Hosts, "allowed_v4_hosts"); err != nil {
+		return err
+	}
+	if err := writeAllowedMap(objs.AllowedV6Hosts, rules.AllowedV6Hosts, "allowed_v6_hosts"); err != nil {
+		return err
+	}
+	if err := writeAllowedMap(objs.AllowedV4Hostports, rules.AllowedV4Pairs, "allowed_v4_hostports"); err != nil {
+		return err
+	}
+	if err := writeAllowedMap(objs.AllowedV6Hostports, rules.AllowedV6Pairs, "allowed_v6_hostports"); err != nil {
 		return err
 	}
 	return nil
@@ -423,6 +781,94 @@ func writeAllowedMap[K comparable](m *ebpf.Map, keys []K, name string) error {
 		}
 	}
 	return nil
+}
+
+func mergeAllowRules(base allowRules, overlay allowRules) allowRules {
+	return canonicalAllowRules(allowRules{
+		AllowAll:       base.AllowAll || overlay.AllowAll,
+		EnableV4:       base.EnableV4 || overlay.EnableV4,
+		EnableV6:       base.EnableV6 || overlay.EnableV6,
+		AllowedMarks:   append(append([]uint32(nil), base.AllowedMarks...), overlay.AllowedMarks...),
+		AllowedPorts:   append(append([]portKey(nil), base.AllowedPorts...), overlay.AllowedPorts...),
+		AllowedV4Hosts: append(append([]uint32(nil), base.AllowedV4Hosts...), overlay.AllowedV4Hosts...),
+		AllowedV6Hosts: append(append([]ipv6AddrKey(nil), base.AllowedV6Hosts...), overlay.AllowedV6Hosts...),
+		AllowedV4Pairs: append(append([]hostport4Key(nil), base.AllowedV4Pairs...), overlay.AllowedV4Pairs...),
+		AllowedV6Pairs: append(append([]hostport6Key(nil), base.AllowedV6Pairs...), overlay.AllowedV6Pairs...),
+	})
+}
+
+func canonicalAllowRules(rules allowRules) allowRules {
+	rules.AllowedMarks = uniqueSorted(rules.AllowedMarks, func(a, b uint32) bool { return a < b })
+	rules.AllowedPorts = uniqueSorted(rules.AllowedPorts, func(a, b portKey) bool {
+		if a.Protocol != b.Protocol {
+			return a.Protocol < b.Protocol
+		}
+		return a.Dport < b.Dport
+	})
+	rules.AllowedV4Hosts = uniqueSorted(rules.AllowedV4Hosts, func(a, b uint32) bool { return a < b })
+	rules.AllowedV6Hosts = uniqueSorted(rules.AllowedV6Hosts, func(a, b ipv6AddrKey) bool {
+		return bytes.Compare(a.Addr[:], b.Addr[:]) < 0
+	})
+	rules.AllowedV4Pairs = uniqueSorted(rules.AllowedV4Pairs, func(a, b hostport4Key) bool {
+		if a.Protocol != b.Protocol {
+			return a.Protocol < b.Protocol
+		}
+		if a.Daddr != b.Daddr {
+			return a.Daddr < b.Daddr
+		}
+		return a.Dport < b.Dport
+	})
+	rules.AllowedV6Pairs = uniqueSorted(rules.AllowedV6Pairs, func(a, b hostport6Key) bool {
+		if a.Protocol != b.Protocol {
+			return a.Protocol < b.Protocol
+		}
+		if cmp := bytes.Compare(a.Daddr[:], b.Daddr[:]); cmp != 0 {
+			return cmp < 0
+		}
+		return a.Dport < b.Dport
+	})
+	return rules
+}
+
+func uniqueSorted[K comparable](values []K, less func(a, b K) bool) []K {
+	if len(values) == 0 {
+		return nil
+	}
+	values = append([]K(nil), values...)
+	sort.Slice(values, func(i, j int) bool {
+		return less(values[i], values[j])
+	})
+	out := values[:0]
+	for _, value := range values {
+		if len(out) == 0 || out[len(out)-1] != value {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func allowRulesEqual(a, b allowRules) bool {
+	return reflect.DeepEqual(canonicalAllowRules(a), canonicalAllowRules(b))
+}
+
+func logPolicy(activeRuleset string, rules allowRules) {
+	if rules.AllowAll {
+		log.Print("WARNING: AllowAll is enabled; protected interfaces will pass all traffic")
+	}
+	if activeRuleset == "" {
+		log.Print("Active ruleset: none")
+	} else {
+		log.Printf("Active ruleset: %s", activeRuleset)
+	}
+	log.Printf("Runtime config: allow_all=%t enable_v4=%t enable_v6=%t", rules.AllowAll, rules.EnableV4, rules.EnableV6)
+	log.Printf("Allowlists: marks=%d ports=%d v4_hosts=%d v6_hosts=%d v4_hostports=%d v6_hostports=%d",
+		len(rules.AllowedMarks),
+		len(rules.AllowedPorts),
+		len(rules.AllowedV4Hosts),
+		len(rules.AllowedV6Hosts),
+		len(rules.AllowedV4Pairs),
+		len(rules.AllowedV6Pairs),
+	)
 }
 
 func allowedPortKeys(values []string) ([]portKey, error) {
@@ -661,8 +1107,9 @@ func (m *egressManager) close() {
 	}
 }
 
-func watchInterfaces(ctx context.Context, manager *egressManager, opts options) error {
-	updates := make(chan netlink.LinkUpdate, 32)
+func watchInterfaces(ctx context.Context, manager *egressManager, policies *policyManager) error {
+	linkUpdates := make(chan netlink.LinkUpdate, 32)
+	addrUpdates := make(chan netlink.AddrUpdate, 32)
 	done := make(chan struct{})
 	defer close(done)
 
@@ -675,13 +1122,18 @@ func watchInterfaces(ctx context.Context, manager *egressManager, opts options) 
 		}
 	}
 
-	if err := netlink.LinkSubscribeWithOptions(updates, done, netlink.LinkSubscribeOptions{
+	if err := netlink.LinkSubscribeWithOptions(linkUpdates, done, netlink.LinkSubscribeOptions{
 		ErrorCallback: errCallback,
 	}); err != nil {
 		return fmt.Errorf("subscribe to netlink link updates: %w", err)
 	}
+	if err := netlink.AddrSubscribeWithOptions(addrUpdates, done, netlink.AddrSubscribeOptions{
+		ErrorCallback: errCallback,
+	}); err != nil {
+		return fmt.Errorf("subscribe to netlink addr updates: %w", err)
+	}
 
-	if _, err := manager.reconcileCurrent(opts, true); err != nil {
+	if _, err := manager.reconcileCurrent(policies.opts, true); err != nil {
 		return err
 	}
 
@@ -691,13 +1143,19 @@ func watchInterfaces(ctx context.Context, manager *egressManager, opts options) 
 			return nil
 		case err := <-subscribeErrs:
 			return fmt.Errorf("netlink link watcher: %w", err)
-		case update := <-updates:
-			if !manager.shouldReconcileLinkUpdate(update, opts) {
-				continue
+		case update := <-linkUpdates:
+			shouldReconcileAttachments := manager.shouldReconcileLinkUpdate(update, policies.opts)
+			if shouldReconcileAttachments {
+				if _, err := manager.reconcileCurrent(policies.opts, false); err != nil {
+					log.Printf("ERROR: reconcile interfaces after netlink update: %s", err)
+				}
 			}
-			logLinkUpdate(update)
-			if _, err := manager.reconcileCurrent(opts, false); err != nil {
-				log.Printf("ERROR: reconcile interfaces after netlink update: %s", err)
+			if _, err := policies.reconcileCurrent(true); err != nil {
+				log.Printf("ERROR: reconcile rulesets after netlink link update: %s", err)
+			}
+		case <-addrUpdates:
+			if _, err := policies.reconcileCurrent(true); err != nil {
+				log.Printf("ERROR: reconcile rulesets after netlink addr update: %s", err)
 			}
 		}
 	}
@@ -788,17 +1246,6 @@ func interfaceMatchesIgnoreSelectors(iface interfaceInfo, opts options) (bool, e
 		}
 	}
 	return false, nil
-}
-
-func logLinkUpdate(update netlink.LinkUpdate) {
-
-	if update.Link == nil || update.Link.Attrs() == nil { //nolint:staticcheck
-		log.Print("Netlink link update received")
-		return
-	} //nolint:staticcheck
-	attrs := update.Link.Attrs() //nolint:staticcheck
-
-	log.Printf("Netlink link update: %s(index %d type %s)", attrs.Name, attrs.Index, update.Link.Type()) //nolint:staticcheck
 }
 
 func interfaceNames(ifaces []interfaceInfo) string {

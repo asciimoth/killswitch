@@ -18,6 +18,28 @@
   "ignored_interface_regexps": [
     "^(veth|br-)"
   ],
+  "rulesets": {
+    "wireguard-up": {
+      "priority": 100,
+      "match": "and",
+      "trigger": {
+        "interface_names": [
+          "wg0"
+        ],
+        "ip_addrs": [
+          "10.64.0.2"
+        ]
+      },
+      "enable_v4": true,
+      "enable_v6": true,
+      "allowed_ports": [
+        "udp/53"
+      ],
+      "allowed_v4_hosts": [
+        "10.64.0.1"
+      ]
+    }
+  },
   "allow_all": false,
   "enable_v4": true,
   "enable_v6": true,
