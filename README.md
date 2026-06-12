@@ -28,6 +28,70 @@ The project includes:
 - Unix-socket admin API with peer credential based authorization.
 - Desktop notifications, tray integration, and networks login pages handling.
 
+## Installation
+### Nix
+Build or run directly from the flake:
+```sh
+nix build github:asciimoth/killswitch#killswitch
+nix profile add github:asciimoth/killswitch#killswitch
+```
+
+You can also use system service:
+```nix
+imports = [ inputs.killswitch.nixosModules.killswitch ];
+
+environment.systemPackages = [
+  inputs.killswitch.packages.${pkgs.system}.killswitch
+];
+
+services.killswitch = {
+  enable = true;
+  settings = {
+    interface_types = [ "device" ];
+    interface_regexps = [ "^(en|wl|ww)" ];
+
+    allow_all = false;
+    enable_v4 = true;
+    enable_v6 = true;
+    # allowed_ports = [ "udp/53" "tcp/53" ];
+
+    socks_proxy = {
+      enabled = true;
+      port =  1080;
+      fwmark = "0xeb9f0001";
+      dns_server = "8.8.8.8";
+      protected = {
+        usernames = [ "root" "myuser" ];
+      };
+    };
+  };
+};
+```
+
+### Deb, and rpm-based systems
+Packages are published to [my deb/rpm repository](https://repo.moth.contact):
+
+Setup it for your sytstem via script (or manually):
+```sh
+curl https://repo.moth.contact/setup.sh | bash
+```
+
+Then install with your system package manager:
+```sh
+sudo apt install killswitch
+# or
+sudo dnf install killswitch
+# or
+sudo yum install killswitch
+```
+
+### GitHub Releases
+Release archives and package artifacts are published on the
+[GitHub releases page](https://github.com/asciimoth/killswitch/releases).
+
+### Arch
+[AUR](https://aur.archlinux.org/packages/killswitch-bin) is available
+
 ## Daemon Setup
 By default, the daemon reads `/etc/killswitch/killswitch.json`. The config is a
 single JSON object; unknown fields are rejected.
