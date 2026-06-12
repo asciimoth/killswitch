@@ -201,6 +201,7 @@
           commitizen
 
           just
+          goreleaser
 
           bpfClang
           llvm.llvm
