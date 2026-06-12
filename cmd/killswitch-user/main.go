@@ -10,6 +10,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,8 +20,10 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/asciimoth/killswitch/internal/adminapi"
+	"github.com/asciimoth/socksgo"
 	"github.com/energye/systray"
 	dbusnotify "github.com/esiqveland/notify"
 	"github.com/godbus/dbus/v5"
@@ -26,12 +31,24 @@ import (
 
 const defaultConfigFileName = "killswitch-user.json"
 const allowAllNotificationActionDisable = "disable-allow-all"
+const networkCheckStatusHeader = "X-NetworkManager-Status"
 
 type configFile struct {
-	SocketPath             string `json:"socket_path,omitempty"`
-	NotifyInterfaceChanges *bool  `json:"notify_interface_changes,omitempty"`
-	NotifyGlobalAllowAll   *bool  `json:"notify_global_allow_all,omitempty"`
-	TrayEnabled            *bool  `json:"tray_enabled,omitempty"`
+	SocketPath             string              `json:"socket_path,omitempty"`
+	NotifyInterfaceChanges *bool               `json:"notify_interface_changes,omitempty"`
+	NotifyGlobalAllowAll   *bool               `json:"notify_global_allow_all,omitempty"`
+	TrayEnabled            *bool               `json:"tray_enabled,omitempty"`
+	NetworkCheck           *networkCheckConfig `json:"network_check,omitempty"`
+}
+
+type networkCheckConfig struct {
+	Period  string `json:"period,omitempty"`
+	URL     string `json:"url,omitempty"`
+	Status  int    `json:"status,omitempty"`
+	Text    string `json:"text,omitempty"`
+	Header  string `json:"header,omitempty"`
+	Timeout string `json:"timeout,omitempty"`
+	Notify  bool   `json:"notify,omitempty"`
 }
 
 type options struct {
@@ -40,6 +57,18 @@ type options struct {
 	NotifyInterfaceChanges bool
 	NotifyGlobalAllowAll   bool
 	TrayEnabled            bool
+	NetworkCheck           networkCheckOptions
+}
+
+type networkCheckOptions struct {
+	Enabled bool
+	Period  time.Duration
+	URL     string
+	Status  int
+	Text    string
+	Header  string
+	Timeout time.Duration
+	Notify  bool
 }
 
 type envLookup func(string) string
@@ -54,6 +83,7 @@ type notifier interface {
 type trayController interface {
 	Start(context.Context, chan<- trayCommand)
 	Update(adminapi.CurrentConfig)
+	UpdateNetwork(networkTrayState)
 	Close()
 }
 
@@ -137,13 +167,75 @@ func loadOptions(configPath string, getenv envLookup) (options, error) {
 		return options{}, fmt.Errorf("socket_path must be absolute, got %q", socketPath)
 	}
 
+	networkCheck, err := networkCheckOptionsFromConfig(cfg.NetworkCheck)
+	if err != nil {
+		return options{}, err
+	}
+
 	return options{
 		ConfigPath:             configPath,
 		SocketPath:             socketPath,
 		NotifyInterfaceChanges: boolConfigValue(cfg.NotifyInterfaceChanges, true),
 		NotifyGlobalAllowAll:   boolConfigValue(cfg.NotifyGlobalAllowAll, true),
 		TrayEnabled:            boolConfigValue(cfg.TrayEnabled, true),
+		NetworkCheck:           networkCheck,
 	}, nil
+}
+
+func networkCheckOptionsFromConfig(cfg *networkCheckConfig) (networkCheckOptions, error) {
+	if cfg == nil || strings.TrimSpace(cfg.URL) == "" {
+		return networkCheckOptions{}, nil
+	}
+
+	checkURL := strings.TrimSpace(cfg.URL)
+	parsedURL, err := url.ParseRequestURI(checkURL)
+	if err != nil {
+		return networkCheckOptions{}, fmt.Errorf("network_check.url: %w", err)
+	}
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return networkCheckOptions{}, fmt.Errorf("network_check.url: unsupported scheme %q", parsedURL.Scheme)
+	}
+	if parsedURL.Host == "" {
+		return networkCheckOptions{}, errors.New("network_check.url: host is required")
+	}
+	if cfg.Status < 100 || cfg.Status > 599 {
+		return networkCheckOptions{}, fmt.Errorf("network_check.status must be an HTTP status code, got %d", cfg.Status)
+	}
+
+	period, err := parseOptionalDuration("network_check.period", cfg.Period)
+	if err != nil {
+		return networkCheckOptions{}, err
+	}
+	timeout, err := parseOptionalDuration("network_check.timeout", cfg.Timeout)
+	if err != nil {
+		return networkCheckOptions{}, err
+	}
+
+	return networkCheckOptions{
+		Enabled: true,
+		Period:  period,
+		URL:     checkURL,
+		Status:  cfg.Status,
+		Text:    cfg.Text,
+		Header:  cfg.Header,
+		Timeout: timeout,
+		Notify:  cfg.Notify,
+	}, nil
+}
+
+func parseOptionalDuration(field, value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", field, err)
+	}
+	if duration < 0 {
+		return 0, fmt.Errorf("%s must not be negative", field)
+	}
+	return duration, nil
 }
 
 func boolConfigValue(value *bool, fallback bool) bool {
@@ -304,9 +396,22 @@ func runClient(ctx context.Context, client *adminapi.Client, notifications notif
 	watcher.applyInitial(cfg)
 	watcher.updateGlobalAllowAll(notifications, cfg)
 	tray.Update(cfg)
+	networkChecks := newNetworkCheckWatcher(opts.NetworkCheck)
+	if opts.NetworkCheck.Enabled {
+		tray.UpdateNetwork(networkTrayState{Enabled: true, Checking: true})
+	}
+	latestConfig := cfg
+	var networkCheckTimer <-chan time.Time
+	if opts.NetworkCheck.Enabled && opts.NetworkCheck.Period > 0 {
+		ticker := time.NewTicker(opts.NetworkCheck.Period)
+		defer ticker.Stop()
+		networkCheckTimer = ticker.C
+	}
+	networkChecks.applyInitial(latestConfig)
 
 	events := make(chan adminapi.EventMessage, 1)
 	mutationResults := make(chan adminapi.MutationResult, 1)
+	networkCheckResults := make(chan networkCheckResult, 1)
 	errs := make(chan error, 1)
 	go func() {
 		for {
@@ -323,6 +428,7 @@ func runClient(ctx context.Context, client *adminapi.Client, notifications notif
 			}
 		}
 	}()
+	networkChecks.check(ctx, latestConfig, networkCheckResults, "start")
 
 	for {
 		select {
@@ -341,6 +447,12 @@ func runClient(ctx context.Context, client *adminapi.Client, notifications notif
 			}
 			watcher.update(notifications, result.Config)
 			tray.Update(result.Config)
+			latestConfig = result.Config
+			networkChecks.checkIfInterfacesChanged(ctx, latestConfig, networkCheckResults, "mutation")
+		case result := <-networkCheckResults:
+			networkChecks.finish(notifications, tray, result)
+		case <-networkCheckTimer:
+			networkChecks.check(ctx, latestConfig, networkCheckResults, "periodic")
 		case err := <-errs:
 			if ctx.Err() != nil {
 				return nil
@@ -355,8 +467,14 @@ func runClient(ctx context.Context, client *adminapi.Client, notifications notif
 			case adminapi.EventTypeConfig:
 				watcher.update(notifications, event.Config)
 				tray.Update(event.Config)
+				latestConfig = event.Config
+				networkChecks.checkIfInterfacesChanged(ctx, latestConfig, networkCheckResults, "config")
 			case adminapi.EventTypeInterfaces, adminapi.EventTypeClients:
 				tray.Update(event.Config)
+				latestConfig = event.Config
+				if event.EventType == adminapi.EventTypeInterfaces {
+					networkChecks.checkInterfacesEvent(ctx, latestConfig, networkCheckResults)
+				}
 			default:
 				continue
 			}
@@ -370,6 +488,221 @@ func disableGlobalAllowAll(client *adminapi.Client) error {
 		Target:    "base_policy.allow_all",
 		Value:     json.RawMessage("false"),
 	})
+}
+
+type networkCheckStatus string
+
+const (
+	networkCheckStatusInternetAvailable networkCheckStatus = "internet available"
+	networkCheckStatusNoInternet        networkCheckStatus = "no internet"
+	networkCheckStatusLoginRequired     networkCheckStatus = "login required"
+)
+
+type networkCheckResult struct {
+	Reason    string
+	Status    networkCheckStatus
+	PortalURL string
+	Proxy     string
+	Detail    string
+}
+
+type networkCheckWatcher struct {
+	opts                   networkCheckOptions
+	running                bool
+	lastStatus             networkCheckStatus
+	haveStatus             bool
+	lastInterfacesSnapshot string
+}
+
+func newNetworkCheckWatcher(opts networkCheckOptions) *networkCheckWatcher {
+	return &networkCheckWatcher{opts: opts}
+}
+
+func (w *networkCheckWatcher) applyInitial(cfg adminapi.CurrentConfig) {
+	w.lastInterfacesSnapshot = interfacesSnapshot(cfg)
+}
+
+func (w *networkCheckWatcher) checkIfInterfacesChanged(ctx context.Context, cfg adminapi.CurrentConfig, results chan<- networkCheckResult, reason string) {
+	snapshot := interfacesSnapshot(cfg)
+	if snapshot == w.lastInterfacesSnapshot {
+		return
+	}
+	w.lastInterfacesSnapshot = snapshot
+	w.check(ctx, cfg, results, reason)
+}
+
+func (w *networkCheckWatcher) checkInterfacesEvent(ctx context.Context, cfg adminapi.CurrentConfig, results chan<- networkCheckResult) {
+	w.lastInterfacesSnapshot = interfacesSnapshot(cfg)
+	w.check(ctx, cfg, results, "interfaces")
+}
+
+func (w *networkCheckWatcher) check(ctx context.Context, cfg adminapi.CurrentConfig, results chan<- networkCheckResult, reason string) {
+	if !w.opts.Enabled {
+		return
+	}
+	if w.running {
+		log.Printf("Network check skipped (%s): previous check is still running", reason)
+		return
+	}
+	w.running = true
+	log.Printf("Network check started (%s): url=%s", reason, w.opts.URL)
+	go func() {
+		result := runNetworkCheck(ctx, w.opts, cfg, reason)
+		select {
+		case results <- result:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+func (w *networkCheckWatcher) finish(notifications notifier, tray trayController, result networkCheckResult) {
+	w.running = false
+	if result.PortalURL != "" {
+		log.Printf("Network check finished (%s): status=%s proxy=%s portal=%s detail=%s", result.Reason, result.Status, result.Proxy, result.PortalURL, result.Detail)
+	} else {
+		log.Printf("Network check finished (%s): status=%s proxy=%s detail=%s", result.Reason, result.Status, result.Proxy, result.Detail)
+	}
+	tray.UpdateNetwork(networkTrayState{
+		Enabled:   true,
+		Status:    result.Status,
+		PortalURL: result.PortalURL,
+	})
+
+	changed := !w.haveStatus || w.lastStatus != result.Status
+	firstInternet := !w.haveStatus && result.Status == networkCheckStatusInternetAvailable
+	w.haveStatus = true
+	w.lastStatus = result.Status
+	if !w.opts.Notify || !changed || firstInternet {
+		return
+	}
+	if err := notifications.Notify(networkCheckNotification(result)); err != nil {
+		log.Printf("send network check notification: %s", err)
+	}
+}
+
+func runNetworkCheck(ctx context.Context, opts networkCheckOptions, cfg adminapi.CurrentConfig, reason string) networkCheckResult {
+	proxy := "direct"
+	client := &http.Client{
+		Transport:     networkCheckTransport(nil),
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Timeout:       opts.Timeout,
+	}
+	if cfg.SocksProxy.Running {
+		proxyAddr := net.JoinHostPort(cfg.SocksProxy.Host, fmt.Sprintf("%d", cfg.SocksProxy.Port))
+		socksClient := &socksgo.Client{
+			SocksVersion: "5",
+			ProxyAddr:    proxyAddr,
+			Filter:       func(_, _ string) bool { return false },
+		}
+		client.Transport = networkCheckTransport(socksClient.Dial)
+		proxy = proxyAddr
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, opts.URL, nil)
+	if err != nil {
+		return networkCheckResult{Reason: reason, Status: networkCheckStatusNoInternet, Proxy: proxy, Detail: err.Error()}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return networkCheckResult{Reason: reason, Status: networkCheckStatusNoInternet, Proxy: proxy, Detail: err.Error()}
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return networkCheckResult{
+			Reason:    reason,
+			Status:    networkCheckStatusLoginRequired,
+			PortalURL: redirectURL(resp, req.URL),
+			Proxy:     proxy,
+			Detail:    fmt.Sprintf("redirect status %d", resp.StatusCode),
+		}
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return networkCheckResult{Reason: reason, Status: networkCheckStatusNoInternet, Proxy: proxy, Detail: err.Error()}
+	}
+
+	if networkCheckMatchesExpected(opts, resp, string(body)) {
+		return networkCheckResult{
+			Reason: reason,
+			Status: networkCheckStatusInternetAvailable,
+			Proxy:  proxy,
+			Detail: fmt.Sprintf("matched status %d", resp.StatusCode),
+		}
+	}
+
+	return networkCheckResult{
+		Reason: reason,
+		Status: networkCheckStatusLoginRequired,
+		Proxy:  proxy,
+		Detail: fmt.Sprintf("unexpected status=%d header=%q body_len=%d", resp.StatusCode, resp.Header.Get(networkCheckStatusHeader), len(body)),
+	}
+}
+
+func networkCheckTransport(dialContext func(context.Context, string, string) (net.Conn, error)) *http.Transport {
+	transport := &http.Transport{}
+	if dialContext != nil {
+		transport.DialContext = dialContext
+	}
+	return transport
+}
+
+func networkCheckMatchesExpected(opts networkCheckOptions, resp *http.Response, body string) bool {
+	if resp.StatusCode != opts.Status {
+		return false
+	}
+	if opts.Header != "" && resp.Header.Get(networkCheckStatusHeader) != opts.Header {
+		return false
+	}
+	if opts.Text != "" && !strings.Contains(body, opts.Text) {
+		return false
+	}
+	return true
+}
+
+func redirectURL(resp *http.Response, base *url.URL) string {
+	location := resp.Header.Get("Location")
+	if location == "" {
+		return ""
+	}
+	parsed, err := url.Parse(location)
+	if err != nil {
+		return location
+	}
+	return base.ResolveReference(parsed).String()
+}
+
+func networkCheckNotification(result networkCheckResult) adminapi.Notification {
+	level := adminapi.NotificationLevelWarn
+	header := "Network connectivity changed"
+	text := string(result.Status)
+	if result.Status == networkCheckStatusInternetAvailable {
+		level = adminapi.NotificationLevelNormal
+		text = "internet available"
+	}
+	if result.PortalURL != "" {
+		text = fmt.Sprintf("%s: %s", text, result.PortalURL)
+	}
+	return adminapi.Notification{
+		Level:  level,
+		Header: header,
+		Text:   text,
+	}
+}
+
+func interfacesSnapshot(cfg adminapi.CurrentConfig) string {
+	data, err := json.Marshal(struct {
+		Interfaces          []adminapi.Interface       `json:"interfaces,omitempty"`
+		EffectiveInterfaces []adminapi.InterfacePolicy `json:"effective_interfaces,omitempty"`
+	}{
+		Interfaces:          cfg.Interfaces,
+		EffectiveInterfaces: cfg.EffectiveInterfaces,
+	})
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 type trayCommandKind int
@@ -567,13 +900,22 @@ type noopTray struct{}
 
 func (noopTray) Start(context.Context, chan<- trayCommand) {}
 func (noopTray) Update(adminapi.CurrentConfig)             {}
+func (noopTray) UpdateNetwork(networkTrayState)            {}
 func (noopTray) Close()                                    {}
 
 type trayState struct {
 	AllowAll          bool
 	SocksProxyEnabled bool
 	SocksProxyRunning bool
+	Network           networkTrayState
 	Interfaces        []trayInterfaceState
+}
+
+type networkTrayState struct {
+	Enabled   bool
+	Checking  bool
+	Status    networkCheckStatus
+	PortalURL string
 }
 
 type trayInterfaceState struct {
@@ -691,6 +1033,7 @@ type systemTray struct {
 	menuBuilt   bool
 	allowAll    *systray.MenuItem
 	socksProxy  *systray.MenuItem
+	network     *systray.MenuItem
 	noIface     *systray.MenuItem
 	ifaceMenu   map[string]*systray.MenuItem
 	rulesetMenu map[string]map[string]*systray.MenuItem
@@ -751,6 +1094,30 @@ func (t *systemTray) Update(cfg adminapi.CurrentConfig) {
 	state := trayStateFromConfig(cfg)
 
 	t.mu.Lock()
+	if t.last != nil {
+		state.Network = t.last.Network
+	}
+	if t.last != nil && trayStatesEqual(*t.last, state) {
+		t.mu.Unlock()
+		return
+	}
+	t.last = &state
+	if !t.ready {
+		t.mu.Unlock()
+		return
+	}
+	t.mu.Unlock()
+
+	t.apply(state)
+}
+
+func (t *systemTray) UpdateNetwork(network networkTrayState) {
+	t.mu.Lock()
+	state := trayState{Network: network}
+	if t.last != nil {
+		state = *t.last
+		state.Network = network
+	}
 	if t.last != nil && trayStatesEqual(*t.last, state) {
 		t.mu.Unlock()
 		return
@@ -779,6 +1146,13 @@ func (t *systemTray) apply(state trayState) {
 	setMenuChecked(t.allowAll, state.AllowAll)
 	setMenuChecked(t.socksProxy, state.SocksProxyEnabled)
 	t.socksProxy.SetTitle(socksProxyTrayTitle(state))
+	t.network.SetTitle(networkTrayTitle(state.Network))
+	t.network.SetTooltip(networkTrayTooltip(state.Network))
+	if state.Network.Enabled {
+		t.network.Show()
+	} else {
+		t.network.Hide()
+	}
 
 	nextIfaces := make(map[string]bool, len(state.Interfaces))
 	for _, iface := range state.Interfaces {
@@ -820,6 +1194,12 @@ func (t *systemTray) buildBaseMenu(state trayState) {
 		t.mu.Unlock()
 		t.send(trayCommand{Kind: trayCommandSetSocksProxy, SocksProxy: enabled})
 	})
+
+	t.network = systray.AddMenuItem(networkTrayTitle(state.Network), networkTrayTooltip(state.Network))
+	t.network.Disable()
+	if !state.Network.Enabled {
+		t.network.Hide()
+	}
 
 	systray.AddSeparator()
 	t.noIface = systray.AddMenuItem("No interfaces", "No killswitch-attached interfaces")
@@ -917,10 +1297,38 @@ func socksProxyTrayTitle(state trayState) string {
 	return "SOCKS proxy"
 }
 
+func networkTrayTitle(state networkTrayState) string {
+	return "Connectivity: " + networkTrayStatusText(state)
+}
+
+func networkTrayTooltip(state networkTrayState) string {
+	if !state.Enabled {
+		return "Network connectivity check is disabled"
+	}
+	if state.PortalURL != "" {
+		return "Captive portal: " + state.PortalURL
+	}
+	return networkTrayTitle(state)
+}
+
+func networkTrayStatusText(state networkTrayState) string {
+	if !state.Enabled {
+		return "disabled"
+	}
+	if state.Checking {
+		return "checking"
+	}
+	if state.Status == "" {
+		return "unknown"
+	}
+	return string(state.Status)
+}
+
 func trayStatesEqual(a, b trayState) bool {
 	return a.AllowAll == b.AllowAll &&
 		a.SocksProxyEnabled == b.SocksProxyEnabled &&
 		a.SocksProxyRunning == b.SocksProxyRunning &&
+		a.Network == b.Network &&
 		trayInterfaceStatesEqual(a.Interfaces, b.Interfaces)
 }
 

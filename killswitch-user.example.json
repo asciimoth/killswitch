@@ -2,5 +2,12 @@
   "socket_path": "/run/killswitch/admin.sock",
   "notify_interface_changes": true,
   "notify_global_allow_all": true,
-  "tray_enabled": true
+  "tray_enabled": true,
+  "network_check": {
+    "period": "300s",
+    "url": "http://connectivity-check.ubuntu.com/",
+    "status": 204,
+    "header": "online",
+    "notify": true
+  }
 }

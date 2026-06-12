@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/asciimoth/killswitch/internal/adminapi"
 )
@@ -117,6 +120,9 @@ func TestLoadOptionsCreatesDefaultConfig(t *testing.T) {
 	if cfg.TrayEnabled == nil || !*cfg.TrayEnabled {
 		t.Fatalf("default config tray_enabled = %v", cfg.TrayEnabled)
 	}
+	if opts.NetworkCheck.Enabled {
+		t.Fatalf("network check enabled by default: %+v", opts.NetworkCheck)
+	}
 }
 
 func TestLoadOptionsRejectsGroupWritableConfig(t *testing.T) {
@@ -162,6 +168,119 @@ func TestLoadOptionsReadsUserIntegrationToggles(t *testing.T) {
 	}
 	if opts.TrayEnabled {
 		t.Fatal("tray enabled, want disabled")
+	}
+}
+
+func TestLoadOptionsReadsNetworkCheck(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "killswitch-user.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"socket_path": "/tmp/admin.sock",
+		"network_check": {
+			"period": "300s",
+			"url": "http://connectivity-check.ubuntu.com/",
+			"status": 204,
+			"text": "ok",
+			"header": "online",
+			"timeout": "5s",
+			"notify": true
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	opts, err := loadOptions(configPath, mapEnv(nil))
+	if err != nil {
+		t.Fatalf("load options: %v", err)
+	}
+	if !opts.NetworkCheck.Enabled {
+		t.Fatal("network check disabled")
+	}
+	if opts.NetworkCheck.Period != 300*time.Second {
+		t.Fatalf("period = %s", opts.NetworkCheck.Period)
+	}
+	if opts.NetworkCheck.Timeout != 5*time.Second {
+		t.Fatalf("timeout = %s", opts.NetworkCheck.Timeout)
+	}
+	if opts.NetworkCheck.Status != 204 || opts.NetworkCheck.Text != "ok" || opts.NetworkCheck.Header != "online" || !opts.NetworkCheck.Notify {
+		t.Fatalf("network check = %+v", opts.NetworkCheck)
+	}
+}
+
+func TestLoadOptionsRejectsInvalidNetworkCheck(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "bad url", data: `{"socket_path":"/tmp/admin.sock","network_check":{"url":"ftp://example.com","status":204}}`},
+		{name: "bad status", data: `{"socket_path":"/tmp/admin.sock","network_check":{"url":"http://example.com","status":99}}`},
+		{name: "bad period", data: `{"socket_path":"/tmp/admin.sock","network_check":{"url":"http://example.com","status":204,"period":"soon"}}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "killswitch-user.json")
+			if err := os.WriteFile(configPath, []byte(tt.data), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if _, err := loadOptions(configPath, mapEnv(nil)); err == nil {
+				t.Fatal("load options succeeded, expected error")
+			}
+		})
+	}
+}
+
+func TestRunNetworkCheckClassifiesExpectedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(networkCheckStatusHeader, "online")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	result := runNetworkCheck(context.Background(), networkCheckOptions{
+		Enabled: true,
+		URL:     server.URL,
+		Status:  http.StatusNoContent,
+		Header:  "online",
+	}, adminapi.CurrentConfig{}, "test")
+	if result.Status != networkCheckStatusInternetAvailable {
+		t.Fatalf("status = %s, detail = %s", result.Status, result.Detail)
+	}
+}
+
+func TestRunNetworkCheckClassifiesRedirectAsLoginRequired(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "/login")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer server.Close()
+
+	result := runNetworkCheck(context.Background(), networkCheckOptions{
+		Enabled: true,
+		URL:     server.URL,
+		Status:  http.StatusNoContent,
+	}, adminapi.CurrentConfig{}, "test")
+	if result.Status != networkCheckStatusLoginRequired {
+		t.Fatalf("status = %s, detail = %s", result.Status, result.Detail)
+	}
+	if result.PortalURL != server.URL+"/login" {
+		t.Fatalf("portal url = %q", result.PortalURL)
+	}
+}
+
+func TestRunNetworkCheckClassifiesUnexpectedResponseAsLoginRequired(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("portal"))
+	}))
+	defer server.Close()
+
+	result := runNetworkCheck(context.Background(), networkCheckOptions{
+		Enabled: true,
+		URL:     server.URL,
+		Status:  http.StatusNoContent,
+	}, adminapi.CurrentConfig{}, "test")
+	if result.Status != networkCheckStatusLoginRequired {
+		t.Fatalf("status = %s, detail = %s", result.Status, result.Detail)
 	}
 }
 
@@ -447,6 +566,7 @@ func TestTrayStateFallsBackToInterfaceKillswitchFlag(t *testing.T) {
 func TestTrayStatesEqualDetectsDifferences(t *testing.T) {
 	base := trayState{
 		AllowAll: true,
+		Network:  networkTrayState{Enabled: true, Status: networkCheckStatusInternetAvailable},
 		Interfaces: []trayInterfaceState{
 			{Name: "eth0", Rulesets: []trayRulesetState{{Name: "vpn", Forced: true}}},
 		},
@@ -460,6 +580,35 @@ func TestTrayStatesEqualDetectsDifferences(t *testing.T) {
 	}
 	if trayStatesEqual(base, changed) {
 		t.Fatal("different tray states are equal")
+	}
+
+	changed = base
+	changed.Network = networkTrayState{Enabled: true, Status: networkCheckStatusNoInternet}
+	if trayStatesEqual(base, changed) {
+		t.Fatal("different network states are equal")
+	}
+}
+
+func TestNetworkTrayTitle(t *testing.T) {
+	tests := []struct {
+		name  string
+		state networkTrayState
+		want  string
+	}{
+		{name: "disabled", want: "Connectivity: disabled"},
+		{name: "checking", state: networkTrayState{Enabled: true, Checking: true}, want: "Connectivity: checking"},
+		{name: "unknown", state: networkTrayState{Enabled: true}, want: "Connectivity: unknown"},
+		{name: "internet", state: networkTrayState{Enabled: true, Status: networkCheckStatusInternetAvailable}, want: "Connectivity: internet available"},
+		{name: "login", state: networkTrayState{Enabled: true, Status: networkCheckStatusLoginRequired}, want: "Connectivity: login required"},
+		{name: "offline", state: networkTrayState{Enabled: true, Status: networkCheckStatusNoInternet}, want: "Connectivity: no internet"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := networkTrayTitle(tt.state); got != tt.want {
+				t.Fatalf("title = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
