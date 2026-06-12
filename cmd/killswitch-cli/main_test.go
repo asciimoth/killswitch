@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"flag"
 	"strings"
 	"testing"
 
@@ -122,6 +124,46 @@ func TestPrintConfigIncludesTemporaryRulesets(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestTopLevelHelpIncludesMutationTargets(t *testing.T) {
+	var stdout bytes.Buffer
+	err := runCLI([]string{"--help"}, &stdout, ioDiscard{})
+	if err != nil {
+		t.Fatalf("help: %v", err)
+	}
+	got := stdout.String()
+	for _, want := range []string{
+		"Available mutation targets:",
+		"interface_types, interface_names, interface_regexps",
+		"base_policy.allowed_v4_hostports, base_policy.allowed_v6_hostports",
+		"ruleset.trigger.gateway_macs",
+		"ruleset.policy.allowed_v4_hostports, ruleset.policy.allowed_v6_hostports",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("help output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestMutationHelpIncludesTargets(t *testing.T) {
+	var stderr bytes.Buffer
+	err := runCLI([]string{"add", "--help"}, ioDiscard{}, &stderr)
+	if !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("help err = %v, want %v", err, flag.ErrHelp)
+	}
+	got := stderr.String()
+	for _, want := range []string{
+		"Usage:",
+		"killswitch-cli add",
+		"Available mutation targets:",
+		"ruleset (requires -ruleset NAME)",
+		"ruleset.trigger.bssids, ruleset.trigger.gateway_macs",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("help output missing %q:\n%s", want, got)
 		}
 	}
 }

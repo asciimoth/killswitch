@@ -501,6 +501,9 @@ func mutationRequestFromArgs(op adminapi.MutationOperation, args []string, stder
 	jsonOutArg, args := extractJSONOutArg(args)
 	flags := flag.NewFlagSet(string(op), flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	flags.Usage = func() {
+		_, _ = fmt.Fprint(flags.Output(), mutationUsage(string(op)))
+	}
 	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
 	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
 	target := flags.String("target", "", "mutation target")
@@ -753,7 +756,52 @@ func printUsage(w io.Writer) error {
 		return err
 	}
 	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch] [--json-out]\n  killswitch-cli notifications [-socket PATH] [--json-out]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT [--json-out]\n  killswitch-cli socks-proxy [-socket PATH] start|stop [--json-out]\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE] [--json-out]\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE... [--json-out]\n  killswitch-cli remove [-socket PATH] -target ruleset -ruleset NAME [--json-out]\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE] [--json-out]\n  killswitch-cli tmp-ruleset [-socket PATH] -interfaces NAME[,NAME...] -json JSON|-json @FILE [--json-out]\n  killswitch-cli force-ruleset [-socket PATH] -interfaces NAME[,NAME...] -ruleset NAME [--json-out]")
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(w, "\n"+availableMutationTargets())
 	return err
+}
+
+func mutationUsage(cmd string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Usage:\n")
+	fmt.Fprintf(&b, "  killswitch-cli %s [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE] [--json-out]\n", cmd)
+	if cmd == "remove" {
+		fmt.Fprintf(&b, "  killswitch-cli remove [-socket PATH] -target ruleset -ruleset NAME [--json-out]\n")
+	}
+	fmt.Fprintf(&b, "\nOptions:\n")
+	fmt.Fprintf(&b, "  -socket, -s PATH        admin API Unix socket path (default %s)\n", adminapi.DefaultSocketPath)
+	fmt.Fprintf(&b, "  -target, -t TARGET      mutation target\n")
+	fmt.Fprintf(&b, "  -ruleset, -r NAME       ruleset name for ruleset mutations\n")
+	fmt.Fprintf(&b, "  -json JSON|@FILE        JSON value for boolean, policy, or ruleset add/set operations\n")
+	fmt.Fprintf(&b, "  --json-out              print compact JSON output\n")
+	fmt.Fprintf(&b, "\n%s\n", availableMutationTargets())
+	return b.String()
+}
+
+func availableMutationTargets() string {
+	return `Available mutation targets:
+  interface lists:
+    interface_types, interface_names, interface_regexps
+    ignored_interface_types, ignored_interface_names, ignored_interface_regexps
+  whole policy/ruleset JSON:
+    base_policy
+    ruleset (requires -ruleset NAME)
+  base policy fields:
+    base_policy.allow_all, base_policy.enable_v4, base_policy.enable_v6
+    base_policy.allowed_marks, base_policy.allowed_ports
+    base_policy.allowed_v4_hosts, base_policy.allowed_v6_hosts
+    base_policy.allowed_v4_hostports, base_policy.allowed_v6_hostports
+  ruleset fields (require -ruleset NAME):
+    ruleset.disabled, ruleset.match_all
+    ruleset.trigger.interface_types, ruleset.trigger.interface_names
+    ruleset.trigger.interface_regexps, ruleset.trigger.ip_addrs
+    ruleset.trigger.ssids, ruleset.trigger.bssids, ruleset.trigger.gateway_macs
+    ruleset.policy.allow_all, ruleset.policy.enable_v4, ruleset.policy.enable_v6
+    ruleset.policy.allowed_marks, ruleset.policy.allowed_ports
+    ruleset.policy.allowed_v4_hosts, ruleset.policy.allowed_v6_hosts
+    ruleset.policy.allowed_v4_hostports, ruleset.policy.allowed_v6_hostports`
 }
 
 func printJSONLine(w io.Writer, value any) error {

@@ -30,6 +30,9 @@ disable: build
 cli-add: build
   ./killswitch-cli add -target base_policy.allowed_ports tcp/443
 
+cli-help: build
+  ./killswitch-cli --help
+
 tmp-ruleset: build
   ./killswitch-cli tmp-ruleset -interfaces wg0 -json '{"enable_v4":true,"allowed_v4_hostports":["udp/198.51.100.10:51820"]}'
 
