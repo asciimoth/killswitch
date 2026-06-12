@@ -162,6 +162,7 @@ type CurrentConfig struct {
 	TemporaryRulesets       []TmpRuleset      `json:"tmp_rulesets,omitempty"`
 	Clients                 []ClientInfo      `json:"clients,omitempty"`
 	AdminAPI                AdminConfig       `json:"admin_api"`
+	SocksProxy              SocksProxyState   `json:"socks_proxy"`
 }
 
 type Interface struct {
@@ -203,6 +204,16 @@ type ClientInfo struct {
 type AdminConfig struct {
 	SocketPath string `json:"socket_path"`
 	Debug      bool   `json:"debug"`
+}
+
+type SocksProxyState struct {
+	Enabled   bool   `json:"enabled"`
+	Running   bool   `json:"running"`
+	Host      string `json:"host"`
+	Port      uint16 `json:"port"`
+	FWMark    string `json:"fwmark"`
+	DNSServer string `json:"dns_server,omitempty"`
+	LastError string `json:"last_error,omitempty"`
 }
 
 type AllowRules struct {

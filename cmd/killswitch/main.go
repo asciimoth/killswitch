@@ -152,6 +152,7 @@ type options struct {
 	IgnoredInterfaceNames   []string
 	IgnoredInterfaceRegexps []string
 	AdminAPI                adminAPIOptions
+	SocksProxy              socksProxyOptions
 	allowRules
 	Rulesets []ruleset
 }
@@ -194,6 +195,7 @@ type configFile struct {
 	IgnoredInterfaceNames   []string                 `json:"ignored_interface_names"`
 	IgnoredInterfaceRegexps []string                 `json:"ignored_interface_regexps"`
 	AdminAPI                adminAPIConfig           `json:"admin_api"`
+	SocksProxy              socksProxyConfig         `json:"socks_proxy"`
 	AllowAll                bool                     `json:"allow_all"`
 	EnableV4                bool                     `json:"enable_v4"`
 	EnableV6                bool                     `json:"enable_v6"`
@@ -257,6 +259,7 @@ type policyManager struct {
 	mu            sync.Mutex
 	objs          *killswitchObjects
 	opts          options
+	socksProxy    socksProxyState
 	tmpRulesets   map[string]temporaryRuleset
 	forceRulesets map[string]map[string]map[string]int
 	current       map[int]interfacePolicy
@@ -335,6 +338,7 @@ func configToOptions(cfg configFile) (options, error) {
 		IgnoredInterfaceNames:   cfg.IgnoredInterfaceNames,
 		IgnoredInterfaceRegexps: cfg.IgnoredInterfaceRegexps,
 		AdminAPI:                adminAPIOptionsFromConfig(cfg.AdminAPI),
+		SocksProxy:              socksProxyOptionsFromConfig(cfg.SocksProxy),
 		allowRules: allowRules{
 			AllowAll: cfg.AllowAll,
 			EnableV4: cfg.EnableV4,
@@ -345,6 +349,9 @@ func configToOptions(cfg configFile) (options, error) {
 		return options{}, errors.New("at least one interface_types, interface_names, or interface_regexps entry is required")
 	}
 	if err := validateAdminAPIOptions(opts.AdminAPI); err != nil {
+		return options{}, err
+	}
+	if err := validateSocksProxyOptions(opts.SocksProxy); err != nil {
 		return options{}, err
 	}
 
@@ -1216,7 +1223,27 @@ func run(parent context.Context, opts options) error {
 	configSnapshot := func() adminapi.CurrentConfig {
 		return currentConfigSnapshot(policies, manager, adminServer.clientSnapshot, notifyError)
 	}
+	proxy := newSocksProxyManager(opts.SocksProxy, func(state socksProxyState) {
+		reconcileMu.Lock()
+		policies.setSocksProxyState(state)
+		_, err := policies.reconcileAttached(manager, true)
+		reconcileMu.Unlock()
+		if err != nil {
+			log.Printf("ERROR: reconcile socks proxy policy state: %s", err)
+			notifyError("SOCKS proxy policy error", err)
+		}
+		if state.LastError != "" {
+			notifyError("SOCKS proxy error", errors.New(state.LastError))
+		}
+		if adminServer != nil {
+			adminServer.notify(adminapi.EventTypeConfig)
+		}
+	})
+	defer proxy.Close()
 	adminServer = newAdminAPIServer(opts.AdminAPI, configSnapshot, func(req adminapi.MutationRequest) adminapi.MutationResult {
+		if req.Target == "socks_proxy" {
+			return applySocksProxyMutation(ctx, req, proxy, policies, manager, &reconcileMu)
+		}
 		return applyAdminMutation(req, policies, manager, &reconcileMu)
 	})
 
@@ -1242,6 +1269,12 @@ func run(parent context.Context, opts options) error {
 			return removeForceRulesets(owner, policies, manager, &reconcileMu)
 		},
 	)
+	if opts.SocksProxy.Enabled {
+		if err := proxy.SetEnabled(ctx, true); err != nil {
+			log.Printf("ERROR: start socks proxy: %s", err)
+			notifyError("SOCKS proxy start error", err)
+		}
+	}
 	go func() {
 		if err := watchInterfaces(ctx, manager, policies, &reconcileMu, func(eventType adminapi.EventType) {
 			adminServer.notify(eventType)
@@ -1416,7 +1449,11 @@ func selectInterfaces(all []interfaceInfo, opts options) ([]interfaceInfo, error
 }
 
 func newPolicyManager(objs *killswitchObjects, opts options) *policyManager {
-	return &policyManager{objs: objs, opts: opts}
+	return &policyManager{
+		objs:       objs,
+		opts:       cloneOptions(opts),
+		socksProxy: socksProxyStateFromOptions(opts.SocksProxy),
+	}
 }
 
 func (m *policyManager) optionsSnapshot() options {
@@ -1429,7 +1466,22 @@ func (m *policyManager) replaceOptions(opts options) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.opts = cloneOptions(opts)
+	if !m.socksProxy.Enabled && !m.socksProxy.Running {
+		m.socksProxy = socksProxyStateFromOptions(opts.SocksProxy)
+	}
 	m.pruneForceRulesetsLocked()
+}
+
+func (m *policyManager) setSocksProxyState(state socksProxyState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.socksProxy = state
+}
+
+func (m *policyManager) socksProxyStateSnapshot() socksProxyState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.socksProxy
 }
 
 func (m *policyManager) temporaryRulesetsSnapshot() []temporaryRuleset {
@@ -1580,11 +1632,12 @@ func (m *policyManager) reconcile(all []interfaceInfo, logChange bool) (bool, er
 	opts := m.optionsSnapshot()
 	tmpRulesets := m.temporaryRulesetsSnapshot()
 	forceRulesets := m.forceRulesetsSnapshot()
+	socksProxy := m.socksProxyStateSnapshot()
 	selected, err := selectInterfaces(all, opts)
 	if err != nil {
 		return false, err
 	}
-	next := effectivePoliciesForInterfaces(selected, opts, tmpRulesets, forceRulesets)
+	next := effectivePoliciesForInterfaces(selected, opts, tmpRulesets, forceRulesets, socksProxy)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1609,6 +1662,7 @@ func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 	current := cloneInterfacePolicyMap(m.current)
 	set := m.set
 	opts := cloneOptions(m.opts)
+	socksProxy := m.socksProxy
 	tmpRulesets := cloneTemporaryRulesets(m.tmpRulesets)
 	forceRulesets := cloneForceRulesets(m.forceRulesets)
 	m.mu.Unlock()
@@ -1630,6 +1684,7 @@ func (m *policyManager) configSnapshot() adminapi.CurrentConfig {
 		Rulesets:                apiRulesets(opts.Rulesets, activeRulesetSet(current)),
 		ForceActiveRulesets:     apiForceRulesets(forceRulesets),
 		TemporaryRulesets:       apiTemporaryRulesets(tmpRulesets),
+		SocksProxy:              apiSocksProxyState(socksProxy),
 		AdminAPI: adminapi.AdminConfig{
 			SocketPath: opts.AdminAPI.SocketPath,
 			Debug:      opts.AdminAPI.Debug,
@@ -1667,7 +1722,7 @@ type forceRuleset struct {
 	Interfaces []string
 }
 
-func effectiveAllowRules(base allowRules, active []ruleset, forceRulesets []ruleset, tmpRulesets []temporaryRuleset) allowRules {
+func effectiveAllowRules(base allowRules, active []ruleset, forceRulesets []ruleset, tmpRulesets []temporaryRuleset, socksProxyStateOpt ...socksProxyState) allowRules {
 	effective := base
 	for _, ruleset := range active {
 		effective = mergeAllowRules(effective, ruleset.allowRules)
@@ -1677,6 +1732,13 @@ func effectiveAllowRules(base allowRules, active []ruleset, forceRulesets []rule
 	}
 	for _, tmp := range tmpRulesets {
 		effective = mergeAllowRules(effective, tmp.Rules)
+	}
+	var socksProxy socksProxyState
+	if len(socksProxyStateOpt) > 0 {
+		socksProxy = socksProxyStateOpt[0]
+	}
+	if socksProxy.Running {
+		effective = mergeAllowRules(effective, allowRules{AllowedMarks: []uint32{socksProxy.FWMark}})
 	}
 	return canonicalAllowRules(effective)
 }
@@ -1708,9 +1770,13 @@ func temporaryRulesetsForInterface(rulesets []temporaryRuleset, ifaceName string
 	return out
 }
 
-func effectivePoliciesForInterfaces(ifaces []interfaceInfo, opts options, tmpRulesets []temporaryRuleset, forceRulesets []forceRuleset) map[int]interfacePolicy {
+func effectivePoliciesForInterfaces(ifaces []interfaceInfo, opts options, tmpRulesets []temporaryRuleset, forceRulesets []forceRuleset, socksProxyStateOpt ...socksProxyState) map[int]interfacePolicy {
 	if len(ifaces) == 0 {
 		return nil
+	}
+	var socksProxy socksProxyState
+	if len(socksProxyStateOpt) > 0 {
+		socksProxy = socksProxyStateOpt[0]
 	}
 	out := make(map[int]interfacePolicy, len(ifaces))
 	for _, iface := range ifaces {
@@ -1719,7 +1785,7 @@ func effectivePoliciesForInterfaces(ifaces []interfaceInfo, opts options, tmpRul
 		tmp := temporaryRulesetsForInterface(tmpRulesets, iface.Name)
 		out[iface.Index] = interfacePolicy{
 			Info:              iface,
-			Rules:             effectiveAllowRules(opts.allowRules, active, forced, tmp),
+			Rules:             effectiveAllowRules(opts.allowRules, active, forced, tmp, socksProxy),
 			ActiveRulesets:    rulesetNames(active),
 			ForcedRulesets:    rulesetNames(forced),
 			TemporaryRulesets: temporaryRulesetOwners(tmp),

@@ -601,6 +601,34 @@ func TestEffectiveAllowRulesMergesTemporaryRulesets(t *testing.T) {
 	}
 }
 
+func TestEffectiveAllowRulesMergesRunningSocksProxyMark(t *testing.T) {
+	effective := effectiveAllowRules(
+		allowRules{AllowedMarks: []uint32{0x42}},
+		nil,
+		nil,
+		nil,
+		socksProxyState{Running: true, FWMark: 0xeb9f0001},
+	)
+
+	if len(effective.AllowedMarks) != 2 || effective.AllowedMarks[0] != 0x42 || effective.AllowedMarks[1] != 0xeb9f0001 {
+		t.Fatalf("allowed marks = %+v", effective.AllowedMarks)
+	}
+}
+
+func TestEffectiveAllowRulesSkipsStoppedSocksProxyMark(t *testing.T) {
+	effective := effectiveAllowRules(
+		allowRules{AllowedMarks: []uint32{0x42}},
+		nil,
+		nil,
+		nil,
+		socksProxyState{Enabled: true, Running: false, FWMark: 0xeb9f0001},
+	)
+
+	if len(effective.AllowedMarks) != 1 || effective.AllowedMarks[0] != 0x42 {
+		t.Fatalf("allowed marks = %+v", effective.AllowedMarks)
+	}
+}
+
 func TestEffectiveAllowRulesMergesForceActiveRulesets(t *testing.T) {
 	effective := effectiveAllowRules(
 		allowRules{EnableV4: true},

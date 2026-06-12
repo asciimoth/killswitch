@@ -51,6 +51,8 @@ func runCLI(args []string, stdout, stderr io.Writer) error {
 		return runNotifications(args[1:], stdout, stderr)
 	case "debug-notify":
 		return runDebugNotify(args[1:], stdout, stderr)
+	case "socks-proxy":
+		return runSocksProxy(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		return printUsage(stdout)
 	default:
@@ -168,6 +170,64 @@ func runDebugNotify(args []string, stdout, stderr io.Writer) error {
 		return printJSONLine(stdout, result)
 	}
 	_, err = fmt.Fprintln(stdout, "sent")
+	return err
+}
+
+func runSocksProxy(args []string, stdout, stderr io.Writer) error {
+	jsonOutArg, args := extractJSONOutArg(args)
+	flags := flag.NewFlagSet("socks-proxy", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	socketPath := flags.String("socket", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	flags.StringVar(socketPath, "s", adminapi.DefaultSocketPath, "admin API Unix socket path")
+	jsonOut := flags.Bool("json-out", jsonOutArg, "print compact JSON output")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("socks-proxy requires exactly one action: start or stop")
+	}
+	var enabled bool
+	switch flags.Arg(0) {
+	case "start":
+		enabled = true
+	case "stop":
+		enabled = false
+	default:
+		return fmt.Errorf("unknown socks-proxy action %q", flags.Arg(0))
+	}
+
+	raw, err := json.Marshal(enabled)
+	if err != nil {
+		return err
+	}
+	client, err := adminapi.DialUnix(context.Background(), *socketPath)
+	if err != nil {
+		return err
+	}
+	defer client.Close() //nolint:errcheck
+	result, err := client.Mutate(adminapi.MutationRequest{
+		Operation: adminapi.MutationSet,
+		Target:    "socks_proxy",
+		Value:     raw,
+	})
+	if err != nil {
+		return err
+	}
+	if !result.OK && result.Error != "" {
+		return errors.New(result.Error)
+	}
+	if *jsonOut {
+		return printJSONLine(stdout, result)
+	}
+	if result.Error != "" {
+		_, err = fmt.Fprintf(stdout, "socks proxy requested %s, but it is not running: %s\n", flags.Arg(0), result.Error)
+		return err
+	}
+	action := "stopped"
+	if enabled {
+		action = "started"
+	}
+	_, err = fmt.Fprintf(stdout, "socks proxy %s\n", action)
 	return err
 }
 
@@ -692,7 +752,7 @@ func printUsage(w io.Writer) error {
 	if _, err := fmt.Fprintln(w, "Usage:"); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch] [--json-out]\n  killswitch-cli notifications [-socket PATH] [--json-out]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT [--json-out]\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE] [--json-out]\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE... [--json-out]\n  killswitch-cli remove [-socket PATH] -target ruleset -ruleset NAME [--json-out]\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE] [--json-out]\n  killswitch-cli tmp-ruleset [-socket PATH] -interfaces NAME[,NAME...] -json JSON|-json @FILE [--json-out]\n  killswitch-cli force-ruleset [-socket PATH] -interfaces NAME[,NAME...] -ruleset NAME [--json-out]")
+	_, err := fmt.Fprintln(w, "  killswitch-cli get-cfg [-socket PATH] [--watch] [--json-out]\n  killswitch-cli notifications [-socket PATH] [--json-out]\n  killswitch-cli debug-notify [-socket PATH] [-level normal|warn|error] [-header TEXT] -text TEXT [--json-out]\n  killswitch-cli socks-proxy [-socket PATH] start|stop [--json-out]\n  killswitch-cli add [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE] [--json-out]\n  killswitch-cli remove [-socket PATH] -target TARGET [-ruleset NAME] VALUE... [--json-out]\n  killswitch-cli remove [-socket PATH] -target ruleset -ruleset NAME [--json-out]\n  killswitch-cli set [-socket PATH] -target TARGET [-ruleset NAME] [VALUE...|-json JSON|-json @FILE] [--json-out]\n  killswitch-cli tmp-ruleset [-socket PATH] -interfaces NAME[,NAME...] -json JSON|-json @FILE [--json-out]\n  killswitch-cli force-ruleset [-socket PATH] -interfaces NAME[,NAME...] -ruleset NAME [--json-out]")
 	return err
 }
 
@@ -717,6 +777,15 @@ func printConfig(w io.Writer, cfg adminapi.CurrentConfig) error {
 
 	printer.println("Admin API")
 	printer.printf("  socket:\t%s\n", cfg.AdminAPI.SocketPath)
+	printer.println()
+
+	printer.println("SOCKS proxy")
+	printer.printf("  enabled:\t%t\n", cfg.SocksProxy.Enabled)
+	printer.printf("  running:\t%t\n", cfg.SocksProxy.Running)
+	printer.printf("  listen:\t%s:%d\n", cfg.SocksProxy.Host, cfg.SocksProxy.Port)
+	printer.printf("  fwmark:\t%s\n", cfg.SocksProxy.FWMark)
+	printer.printOptional("  dns server", cfg.SocksProxy.DNSServer)
+	printer.printOptional("  last error", cfg.SocksProxy.LastError)
 	printer.println()
 
 	printer.println("Interfaces")

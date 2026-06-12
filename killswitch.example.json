@@ -28,6 +28,12 @@
       ]
     }
   },
+  "socks_proxy": {
+    "enabled": true,
+    "port": 1080,
+    "fwmark": "0xeb9f0001",
+    "dns_server": "8.8.8.8"
+  },
   "rulesets": {
     "wireguard-up": {
       "disabled": false,
@@ -67,10 +73,7 @@
     "0x42",
     "100"
   ],
-  "allowed_ports": [
-    "tcp/53",
-    "udp/53"
-  ],
+  "allowed_ports": [],
   "allowed_v4_hosts": [
     "198.51.100.10",
     "203.0.113.20"

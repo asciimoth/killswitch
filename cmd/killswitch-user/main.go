@@ -377,11 +377,13 @@ type trayCommandKind int
 const (
 	trayCommandSetAllowAll trayCommandKind = iota + 1
 	trayCommandForceRuleset
+	trayCommandSetSocksProxy
 )
 
 type trayCommand struct {
 	Kind       trayCommandKind
 	AllowAll   bool
+	SocksProxy bool
 	Ruleset    string
 	Force      bool
 	Interfaces []string
@@ -409,6 +411,16 @@ func applyTrayCommand(client *adminapi.Client, cmd trayCommand) error {
 			Target:     "force_ruleset",
 			Ruleset:    cmd.Ruleset,
 			Interfaces: cmd.Interfaces,
+		})
+	case trayCommandSetSocksProxy:
+		value := "false"
+		if cmd.SocksProxy {
+			value = "true"
+		}
+		return client.Send(adminapi.MutationRequest{
+			Operation: adminapi.MutationSet,
+			Target:    "socks_proxy",
+			Value:     json.RawMessage(value),
 		})
 	default:
 		return fmt.Errorf("unknown tray command kind %d", cmd.Kind)
@@ -558,8 +570,10 @@ func (noopTray) Update(adminapi.CurrentConfig)             {}
 func (noopTray) Close()                                    {}
 
 type trayState struct {
-	AllowAll   bool
-	Interfaces []trayInterfaceState
+	AllowAll          bool
+	SocksProxyEnabled bool
+	SocksProxyRunning bool
+	Interfaces        []trayInterfaceState
 }
 
 type trayInterfaceState struct {
@@ -599,8 +613,10 @@ func trayStateFromConfig(cfg adminapi.CurrentConfig) trayState {
 		})
 	}
 	return trayState{
-		AllowAll:   cfg.BasePolicy.AllowAll,
-		Interfaces: interfaces,
+		AllowAll:          cfg.BasePolicy.AllowAll,
+		SocksProxyEnabled: cfg.SocksProxy.Enabled,
+		SocksProxyRunning: cfg.SocksProxy.Running,
+		Interfaces:        interfaces,
 	}
 }
 
@@ -674,6 +690,7 @@ type systemTray struct {
 	last        *trayState
 	menuBuilt   bool
 	allowAll    *systray.MenuItem
+	socksProxy  *systray.MenuItem
 	noIface     *systray.MenuItem
 	ifaceMenu   map[string]*systray.MenuItem
 	rulesetMenu map[string]map[string]*systray.MenuItem
@@ -756,10 +773,12 @@ func (t *systemTray) apply(state trayState) {
 	}
 
 	if !t.menuBuilt {
-		t.buildBaseMenu(state.AllowAll)
+		t.buildBaseMenu(state)
 	}
 
 	setMenuChecked(t.allowAll, state.AllowAll)
+	setMenuChecked(t.socksProxy, state.SocksProxyEnabled)
+	t.socksProxy.SetTitle(socksProxyTrayTitle(state))
 
 	nextIfaces := make(map[string]bool, len(state.Interfaces))
 	for _, iface := range state.Interfaces {
@@ -783,15 +802,23 @@ func (t *systemTray) apply(state trayState) {
 	t.allowAll.SetTitle("Allow all")
 }
 
-func (t *systemTray) buildBaseMenu(allowAll bool) {
+func (t *systemTray) buildBaseMenu(state trayState) {
 	t.menuBuilt = true
 
-	t.allowAll = systray.AddMenuItemCheckbox("Allow all", "Toggle global allow_all", allowAll)
+	t.allowAll = systray.AddMenuItemCheckbox("Allow all", "Toggle global allow_all", state.AllowAll)
 	t.allowAll.Click(func() {
 		t.mu.Lock()
 		allowAll := t.last == nil || !t.last.AllowAll
 		t.mu.Unlock()
 		t.send(trayCommand{Kind: trayCommandSetAllowAll, AllowAll: allowAll})
+	})
+
+	t.socksProxy = systray.AddMenuItemCheckbox(socksProxyTrayTitle(state), "Toggle localhost SOCKS proxy", state.SocksProxyEnabled)
+	t.socksProxy.Click(func() {
+		t.mu.Lock()
+		enabled := t.last == nil || !t.last.SocksProxyEnabled
+		t.mu.Unlock()
+		t.send(trayCommand{Kind: trayCommandSetSocksProxy, SocksProxy: enabled})
 	})
 
 	systray.AddSeparator()
@@ -883,8 +910,17 @@ func rulesetTrayTitle(ruleset trayRulesetState) string {
 	return ruleset.Name
 }
 
+func socksProxyTrayTitle(state trayState) string {
+	if state.SocksProxyEnabled && !state.SocksProxyRunning {
+		return "SOCKS proxy (not running)"
+	}
+	return "SOCKS proxy"
+}
+
 func trayStatesEqual(a, b trayState) bool {
 	return a.AllowAll == b.AllowAll &&
+		a.SocksProxyEnabled == b.SocksProxyEnabled &&
+		a.SocksProxyRunning == b.SocksProxyRunning &&
 		trayInterfaceStatesEqual(a.Interfaces, b.Interfaces)
 }
 
