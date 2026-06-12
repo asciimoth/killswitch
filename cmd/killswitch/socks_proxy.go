@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/asciimoth/gonnect"
+	gonnectprotected "github.com/asciimoth/gonnect/protected"
 	"github.com/asciimoth/killswitch/internal/adminapi"
 	"github.com/asciimoth/killswitch/internal/policy"
 	"github.com/asciimoth/socksgo"
@@ -27,10 +28,17 @@ const (
 )
 
 type socksProxyConfig struct {
-	Enabled   bool   `json:"enabled"`
-	Port      uint16 `json:"port"`
-	FWMark    string `json:"fwmark"`
-	DNSServer string `json:"dns_server"`
+	Enabled   bool                      `json:"enabled"`
+	Port      uint16                    `json:"port"`
+	FWMark    string                    `json:"fwmark"`
+	DNSServer string                    `json:"dns_server"`
+	Protected socksProxyProtectedConfig `json:"protected"`
+}
+
+type socksProxyProtectedConfig struct {
+	UIDs      []uint32 `json:"uids"`
+	GIDs      []uint32 `json:"gids"`
+	Usernames []string `json:"usernames"`
 }
 
 type socksProxyOptions struct {
@@ -38,6 +46,13 @@ type socksProxyOptions struct {
 	Port      uint16
 	FWMark    uint32
 	DNSServer string
+	Protected socksProxyProtectedOptions
+}
+
+type socksProxyProtectedOptions struct {
+	UIDs      []uint32
+	GIDs      []uint32
+	Usernames []string
 }
 
 type socksProxyState struct {
@@ -63,6 +78,11 @@ func socksProxyOptionsFromConfig(cfg socksProxyConfig) socksProxyOptions {
 		Enabled:   cfg.Enabled,
 		Port:      cfg.Port,
 		DNSServer: strings.TrimSpace(cfg.DNSServer),
+		Protected: socksProxyProtectedOptions{
+			UIDs:      cfg.Protected.UIDs,
+			GIDs:      cfg.Protected.GIDs,
+			Usernames: trimStrings(cfg.Protected.Usernames),
+		},
 	}
 	if opts.Port == 0 {
 		opts.Port = defaultSocksProxyPort
@@ -86,7 +106,23 @@ func validateSocksProxyOptions(opts socksProxyOptions) error {
 			return fmt.Errorf("socks_proxy.dns_server: %w", err)
 		}
 	}
+	for _, username := range opts.Protected.Usernames {
+		if username == "" {
+			return errors.New("socks_proxy.protected.usernames entries must not be empty")
+		}
+	}
 	return nil
+}
+
+func trimStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	trimmed := make([]string, len(values))
+	for i, value := range values {
+		trimmed[i] = strings.TrimSpace(value)
+	}
+	return trimmed
 }
 
 func netipAddrOrHostPort(value string) (string, error) {
@@ -171,6 +207,13 @@ func (m *socksProxyManager) start(parent context.Context) error {
 		m.setStartError(fmt.Errorf("listen socks proxy: %w", err))
 		return err
 	}
+	listener, err = protectedSocksProxyListener(listener, opts.Protected)
+	if err != nil {
+		_ = listener.Close()
+		err = fmt.Errorf("protect socks proxy listener: %w", err)
+		m.setStartError(err)
+		return err
+	}
 
 	ctx, cancel := context.WithCancel(parent)
 	server := protectedSocksServer(opts)
@@ -186,6 +229,25 @@ func (m *socksProxyManager) start(parent context.Context) error {
 
 	go m.serve(ctx, server, listener)
 	return nil
+}
+
+func protectedSocksProxyListener(listener net.Listener, opts socksProxyProtectedOptions) (net.Listener, error) {
+	if !opts.HasRules() {
+		return listener, nil
+	}
+	return gonnectprotected.NewListener(listener, opts.Rules())
+}
+
+func (opts socksProxyProtectedOptions) HasRules() bool {
+	return len(opts.UIDs) > 0 || len(opts.GIDs) > 0 || len(opts.Usernames) > 0
+}
+
+func (opts socksProxyProtectedOptions) Rules() gonnectprotected.Rules {
+	return gonnectprotected.Rules{
+		UIDs:      opts.UIDs,
+		GIDs:      opts.GIDs,
+		Usernames: opts.Usernames,
+	}
 }
 
 func (m *socksProxyManager) serve(ctx context.Context, server *socksgo.Server, listener net.Listener) {

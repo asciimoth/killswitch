@@ -32,7 +32,15 @@
     "enabled": true,
     "port": 1080,
     "fwmark": "0xeb9f0001",
-    "dns_server": "8.8.8.8"
+    "dns_server": "8.8.8.8",
+    "protected": {
+      "uids": [
+        0, 1000
+      ],
+      "usernames": [
+        "root", "moth"
+      ]
+    }
   },
   "rulesets": {
     "wireguard-up": {

@@ -101,6 +101,50 @@ func TestConfigToOptions(t *testing.T) {
 	assertParsedOptions(t, opts)
 }
 
+func TestConfigToOptionsParsesSocksProxyProtectedRules(t *testing.T) {
+	opts, err := configToOptions(configFile{
+		InterfaceNames: []string{"eth0"},
+		SocksProxy: socksProxyConfig{
+			Protected: socksProxyProtectedConfig{
+				UIDs:      []uint32{0, 1000},
+				GIDs:      []uint32{1000},
+				Usernames: []string{" root ", "moth"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("config to options: %v", err)
+	}
+
+	protected := opts.SocksProxy.Protected
+	if len(protected.UIDs) != 2 || protected.UIDs[0] != 0 || protected.UIDs[1] != 1000 {
+		t.Fatalf("unexpected protected uids: %+v", protected.UIDs)
+	}
+	if len(protected.GIDs) != 1 || protected.GIDs[0] != 1000 {
+		t.Fatalf("unexpected protected gids: %+v", protected.GIDs)
+	}
+	if got := strings.Join(protected.Usernames, ","); got != "root,moth" {
+		t.Fatalf("unexpected protected usernames: %+v", protected.Usernames)
+	}
+}
+
+func TestConfigToOptionsRejectsEmptySocksProxyProtectedUsername(t *testing.T) {
+	_, err := configToOptions(configFile{
+		InterfaceNames: []string{"eth0"},
+		SocksProxy: socksProxyConfig{
+			Protected: socksProxyProtectedConfig{
+				Usernames: []string{" "},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected empty protected username error")
+	}
+	if !strings.Contains(err.Error(), "socks_proxy.protected.usernames") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestConfigToOptionsParsesRulesets(t *testing.T) {
 	opts, err := configToOptions(configFile{
 		InterfaceNames: []string{"eth0"},
