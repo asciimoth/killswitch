@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -36,6 +37,9 @@ const defaultConfigFileName = "killswitch-user.json"
 const allowAllNotificationActionDisable = "disable-allow-all"
 const captivePortalNotificationActionOpen = "open-captive-portal"
 const networkCheckStatusHeader = "X-NetworkManager-Status"
+
+//go:embed embed/tray.png
+var trayIcon []byte
 
 type configFile struct {
 	SocketPath             string              `json:"socket_path,omitempty"`
@@ -1283,6 +1287,7 @@ func (t *systemTray) Start(ctx context.Context, commands chan<- trayCommand) {
 }
 
 func (t *systemTray) onReady() {
+	systray.SetIcon(trayIcon)
 	systray.SetTitle("KS")
 	systray.SetTooltip("Killswitch")
 
