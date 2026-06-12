@@ -72,6 +72,7 @@
           go
           golangci-lint
           gopls
+          gotools
 
           typos
           commitizen

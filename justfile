@@ -8,7 +8,6 @@ build: generate
   go build -o killswitch ./cmd/killswitch
   go build -o killswitch-user ./cmd/killswitch-user
   go build -o killswitch-cli ./cmd/killswitch-cli
-  go build -o killswitch-gui ./cmd/killswitch-gui
 
 daemon: build
   sudo ./killswitch ./killswitch.example.json
