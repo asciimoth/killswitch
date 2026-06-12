@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -206,6 +207,37 @@ func TestLoadOptionsReadsNetworkCheck(t *testing.T) {
 	}
 }
 
+func TestLoadOptionsReadsCaptivePortalCommand(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "killswitch-user.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"socket_path": "/tmp/admin.sock",
+		"network_check": {
+			"url": "http://connectivity-check.ubuntu.com/",
+			"status": 204,
+			"captive_portal": {
+				"env": {
+					"MY_TMP_DIR": "{{.Tmp}}"
+				},
+				"cmd": ["chromium", "--proxy-server={{.ProxyAddr}}", "{{.Portal}}"]
+			}
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	opts, err := loadOptions(configPath, mapEnv(nil))
+	if err != nil {
+		t.Fatalf("load options: %v", err)
+	}
+	if got := opts.NetworkCheck.CaptivePortal.Env["MY_TMP_DIR"]; got != "{{.Tmp}}" {
+		t.Fatalf("env template = %q", got)
+	}
+	wantCmd := []string{"chromium", "--proxy-server={{.ProxyAddr}}", "{{.Portal}}"}
+	if !reflect.DeepEqual(opts.NetworkCheck.CaptivePortal.Cmd, wantCmd) {
+		t.Fatalf("cmd = %+v, want %+v", opts.NetworkCheck.CaptivePortal.Cmd, wantCmd)
+	}
+}
+
 func TestLoadOptionsRejectsInvalidNetworkCheck(t *testing.T) {
 	tests := []struct {
 		name string
@@ -281,6 +313,117 @@ func TestRunNetworkCheckClassifiesUnexpectedResponseAsLoginRequired(t *testing.T
 	}, adminapi.CurrentConfig{}, "test")
 	if result.Status != networkCheckStatusLoginRequired {
 		t.Fatalf("status = %s, detail = %s", result.Status, result.Detail)
+	}
+}
+
+func TestExecuteCaptivePortalCommandRendersTemplatesAndRemovesTempDir(t *testing.T) {
+	outPath := filepath.Join(t.TempDir(), "portal-command.txt")
+	notifications := &recordingNotifier{}
+
+	executeCaptivePortalCommand(context.Background(), notifications, captivePortalOptions{
+		Env: map[string]string{
+			"MY_TMP_DIR": "{{.Tmp}}",
+			"OUT":        outPath,
+		},
+		Cmd: []string{
+			"sh",
+			"-c",
+			"printf '%s\n%s\n%s\n%s\n%s\n' \"$MY_TMP_DIR\" \"$1\" \"$2\" \"$3\" \"$4\" > \"$OUT\"",
+			"sh",
+			"{{.Tmp}}",
+			"{{.ProxyHost}}",
+			"{{.ProxyPort}}",
+			"{{.Portal}}",
+		},
+	}, networkCheckResult{
+		Status:         networkCheckStatusLoginRequired,
+		SocksProxyHost: "127.0.0.1",
+		SocksProxyPort: 1080,
+		SocksProxyAddr: "socks5://127.0.0.1:1080",
+	})
+
+	if len(notifications.notifications) != 0 {
+		t.Fatalf("notifications = %+v", notifications.notifications)
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read command output: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("command output = %q", data)
+	}
+	tmpFromEnv, tmpFromArg := lines[0], lines[1]
+	if tmpFromEnv == "" || tmpFromEnv != tmpFromArg {
+		t.Fatalf("tmp values = %q, %q", tmpFromEnv, tmpFromArg)
+	}
+	if !filepath.IsAbs(tmpFromEnv) {
+		t.Fatalf("tmp path is not absolute: %q", tmpFromEnv)
+	}
+	if _, err := os.Stat(tmpFromEnv); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temp dir still exists or stat failed unexpectedly: %v", err)
+	}
+	if lines[2] != "127.0.0.1" || lines[3] != "1080" || lines[4] != "http://example.com" {
+		t.Fatalf("rendered values = %+v", lines)
+	}
+}
+
+func TestExecuteCaptivePortalCommandNotifiesTemplateErrors(t *testing.T) {
+	notifications := &recordingNotifier{}
+
+	executeCaptivePortalCommand(context.Background(), notifications, captivePortalOptions{
+		Cmd: []string{"sh", "-c", "{{.Missing}}"},
+	}, networkCheckResult{Status: networkCheckStatusLoginRequired})
+
+	if len(notifications.notifications) != 1 {
+		t.Fatalf("notifications = %+v", notifications.notifications)
+	}
+	if notifications.notifications[0].Level != adminapi.NotificationLevelError ||
+		notifications.notifications[0].Header != "Captive portal command failed" {
+		t.Fatalf("notification = %+v", notifications.notifications[0])
+	}
+}
+
+func TestNetworkCheckWatcherCaptivePortalCommandRunsOnOpenOnly(t *testing.T) {
+	outPath := filepath.Join(t.TempDir(), "portal-command.txt")
+	notifications := &recordingNotifier{}
+	watcher := newNetworkCheckWatcher(networkCheckOptions{
+		Enabled: true,
+		Notify:  true,
+		CaptivePortal: captivePortalOptions{
+			Cmd: []string{"sh", "-c", "printf '%s' \"$1\" > \"$2\"", "sh", "{{.Portal}}", outPath},
+		},
+	})
+
+	watcher.finish(context.Background(), notifications, noopTray{}, networkCheckResult{
+		Status:    networkCheckStatusLoginRequired,
+		PortalURL: "http://portal.example/login",
+	})
+
+	if notifications.captivePortalCount != 1 {
+		t.Fatalf("captive portal notifications = %d", notifications.captivePortalCount)
+	}
+	if notifications.openCaptivePortal == nil {
+		t.Fatal("open captive portal callback is nil")
+	}
+	if _, err := os.Stat(outPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("command ran before open callback: %v", err)
+	}
+
+	notifications.openCaptivePortal()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		data, err := os.ReadFile(outPath)
+		if err == nil {
+			if string(data) != "http://portal.example/login" {
+				t.Fatalf("command output = %q", data)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("command did not run after open callback: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -647,6 +790,9 @@ type recordingNotifier struct {
 	globalAllowAllCount      int
 	closeGlobalAllowAllCount int
 	disableGlobalAllowAll    func()
+	captivePortalCount       int
+	closeCaptivePortalCount  int
+	openCaptivePortal        func()
 	closed                   bool
 }
 
@@ -666,6 +812,22 @@ func (n *recordingNotifier) NotifyGlobalAllowAll(disable func()) error {
 
 func (n *recordingNotifier) CloseGlobalAllowAll() error {
 	n.closeGlobalAllowAllCount++
+	return nil
+}
+
+func (n *recordingNotifier) NotifyCaptivePortal(notification adminapi.Notification, open func()) error {
+	n.notifications = append(n.notifications, notification)
+	n.captivePortalCount++
+	n.openCaptivePortal = open
+	if n.cancel != nil {
+		n.cancel()
+	}
+	return nil
+}
+
+func (n *recordingNotifier) CloseCaptivePortal() error {
+	n.closeCaptivePortalCount++
+	n.openCaptivePortal = nil
 	return nil
 }
 

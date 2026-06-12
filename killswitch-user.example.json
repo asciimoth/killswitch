@@ -8,6 +8,20 @@
     "url": "http://connectivity-check.ubuntu.com/",
     "status": 204,
     "header": "online",
-    "notify": true
+    "notify": true,
+    "captive_portal": {
+      "env": {
+        "MY_TMP_DIR": "{{.Tmp}}"
+      },
+      "cmd": [
+        "chromium",
+        "--proxy-server={{.ProxyAddr}}",
+        "--user-data-dir={{.Tmp}}",
+        "--no-first-run",
+        "--password-store=basic",
+        "--disable-features=DbusSecretPorta",
+        "{{.Portal}}"
+      ]
+    }
   }
 }
