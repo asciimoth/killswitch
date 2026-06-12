@@ -1,5 +1,6 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 set dotenv-load := true
+set dotenv-override := true
 
 generate:
   go generate ./...
@@ -55,7 +56,17 @@ release-check-env:
 	done; \
 	if [ "${missing}" -ne 0 ]; then \
 		exit 1; \
-	fi
+	fi; \
+	if [ ! -r "${AUR_KEY}" ]; then \
+		echo "AUR_KEY does not point to a readable private key: ${AUR_KEY}" >&2; \
+		exit 1; \
+	fi; \
+	case "$(head -n1 "${AUR_KEY}")" in \
+		ssh-*|ecdsa-*|sk-*) \
+			echo "AUR_KEY points to a public key, but GoReleaser needs the private key: ${AUR_KEY}" >&2; \
+			exit 1; \
+			;; \
+	esac
 
 release-check: release-check-env
 	goreleaser check
@@ -66,4 +77,3 @@ release-snapshot: release-check-env
 release: release-check-env
 	SSH_BIN="${SSH_BIN:-$(command -v ssh)}" goreleaser release --clean --skip=validate
 	"$MYREPO/maintain" save feat "add pmark $(git describe --tags --abbrev=0)"
-

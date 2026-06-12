@@ -122,6 +122,8 @@ aurs:
     git_ssh_command: '{{ .Env.SSH_BIN }} -i "{{ .KeyPath }}" -o StrictHostKeyChecking=accept-new -F /dev/null'
     provides:
       - killswitch
+      - killswitch-cli
+      - killswitch-user
     depends:
       - glibc
     package: |-
