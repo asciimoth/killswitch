@@ -51,6 +51,11 @@ type options struct {
 	NetworkCheck           networkCheckOptions
 }
 
+type cliOptions struct {
+	ConfigPath   string
+	StartupDelay time.Duration
+}
+
 type networkCheckOptions struct {
 	Enabled       bool
 	Period        time.Duration
@@ -70,29 +75,33 @@ type captivePortalOptions struct {
 
 type envLookup func(string) string
 
-func parseArgs(args []string) (string, error) {
+func parseArgs(args []string) (cliOptions, error) {
 	flags := flag.NewFlagSet("killswitch-user", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 
 	configPath := flags.String("config", "", "config path")
 	flags.StringVar(configPath, "c", "", "config path")
+	startupDelay := flags.Duration("delay", 0, "delay startup, for example 10s")
 
 	if err := flags.Parse(args); err != nil {
-		return "", err
+		return cliOptions{}, err
 	}
 	if flags.NArg() > 1 {
-		return "", fmt.Errorf("expected at most one config path argument, got: %s", strings.Join(flags.Args(), " "))
+		return cliOptions{}, fmt.Errorf("expected at most one config path argument, got: %s", strings.Join(flags.Args(), " "))
 	}
 	if *configPath != "" && flags.NArg() == 1 {
-		return "", errors.New("config path must be provided either with -config or as a positional argument, not both")
+		return cliOptions{}, errors.New("config path must be provided either with -config or as a positional argument, not both")
+	}
+	if *startupDelay < 0 {
+		return cliOptions{}, errors.New("delay must not be negative")
 	}
 	if *configPath != "" {
-		return *configPath, nil
+		return cliOptions{ConfigPath: *configPath, StartupDelay: *startupDelay}, nil
 	}
 	if flags.NArg() == 1 {
-		return flags.Arg(0), nil
+		return cliOptions{ConfigPath: flags.Arg(0), StartupDelay: *startupDelay}, nil
 	}
-	return "", nil
+	return cliOptions{StartupDelay: *startupDelay}, nil
 }
 
 func loadOptions(configPath string, getenv envLookup) (options, error) {

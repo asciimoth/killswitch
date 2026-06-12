@@ -19,14 +19,17 @@ import (
 
 func TestParseArgs(t *testing.T) {
 	tests := []struct {
-		name string
-		args []string
-		want string
+		name      string
+		args      []string
+		wantPath  string
+		wantDelay time.Duration
 	}{
-		{name: "empty", want: ""},
-		{name: "positional", args: []string{"/tmp/killswitch-user.json"}, want: "/tmp/killswitch-user.json"},
-		{name: "config flag", args: []string{"-config", "/tmp/flag.json"}, want: "/tmp/flag.json"},
-		{name: "short flag", args: []string{"-c", "/tmp/short.json"}, want: "/tmp/short.json"},
+		{name: "empty"},
+		{name: "positional", args: []string{"/tmp/killswitch-user.json"}, wantPath: "/tmp/killswitch-user.json"},
+		{name: "config flag", args: []string{"-config", "/tmp/flag.json"}, wantPath: "/tmp/flag.json"},
+		{name: "short flag", args: []string{"-c", "/tmp/short.json"}, wantPath: "/tmp/short.json"},
+		{name: "delay", args: []string{"--delay", "10s"}, wantDelay: 10 * time.Second},
+		{name: "delay with config", args: []string{"--delay", "500ms", "-c", "/tmp/short.json"}, wantPath: "/tmp/short.json", wantDelay: 500 * time.Millisecond},
 	}
 
 	for _, tt := range tests {
@@ -35,8 +38,11 @@ func TestParseArgs(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse args: %v", err)
 			}
-			if got != tt.want {
-				t.Fatalf("config path = %q, want %q", got, tt.want)
+			if got.ConfigPath != tt.wantPath {
+				t.Fatalf("config path = %q, want %q", got.ConfigPath, tt.wantPath)
+			}
+			if got.StartupDelay != tt.wantDelay {
+				t.Fatalf("startup delay = %s, want %s", got.StartupDelay, tt.wantDelay)
 			}
 		})
 	}
@@ -45,6 +51,18 @@ func TestParseArgs(t *testing.T) {
 func TestParseArgsRejectsAmbiguousConfigPath(t *testing.T) {
 	if _, err := parseArgs([]string{"-config", "/tmp/flag.json", "/tmp/positional.json"}); err == nil {
 		t.Fatal("parse args succeeded, expected error")
+	}
+}
+
+func TestParseArgsRejectsInvalidDelay(t *testing.T) {
+	tests := [][]string{
+		{"--delay", "soon"},
+		{"--delay", "-1s"},
+	}
+	for _, args := range tests {
+		if _, err := parseArgs(args); err == nil {
+			t.Fatalf("parse args %v succeeded, expected error", args)
+		}
 	}
 }
 

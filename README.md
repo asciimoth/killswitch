@@ -188,6 +188,12 @@ or:
 ~/.config/killswitch/killswitch-user.json
 ```
 
+If your session starts `killswitch-user` before the desktop bar or D-Bus services
+are ready, add a startup delay:
+```sh
+killswitch-user --delay 10s
+```
+
 Example:
 ```json
 {
@@ -328,4 +334,3 @@ You can regenerate them with:
 ```sh
 go generate ./...
 ```
-

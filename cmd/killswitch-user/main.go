@@ -8,15 +8,16 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 func main() {
-	configPath, err := parseArgs(os.Args[1:])
+	cliOpts, err := parseArgs(os.Args[1:])
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	opts, err := loadOptions(configPath, os.Getenv)
+	opts, err := loadOptions(cliOpts.ConfigPath, os.Getenv)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -24,7 +25,25 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if err := waitStartupDelay(ctx, cliOpts.StartupDelay); err != nil {
+		log.Fatal(err)
+	}
+
 	if err := run(ctx, opts, newDesktopNotifier()); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func waitStartupDelay(ctx context.Context, delay time.Duration) error {
+	if delay == 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
