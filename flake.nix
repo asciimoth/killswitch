@@ -143,7 +143,7 @@
 
       killswitch = pkgs.buildGoModule {
         pname = "killswitch";
-        version = "0.1.4";
+        version = "0.1.5";
         src = ./.;
         vendorHash = "sha256-R6IPwurr2qMQNvMLCBNMugFCokNm1E9Jyl8W5LesPJE=";
         proxyVendor = true;

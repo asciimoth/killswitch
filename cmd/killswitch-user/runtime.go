@@ -40,6 +40,14 @@ func run(ctx context.Context, opts options, notifications notifier) error {
 		}
 	}()
 
+	trayCommands := make(chan trayCommand, 8)
+	tray := trayController(noopTray{})
+	if opts.TrayEnabled {
+		tray = newSystemTray()
+		tray.Start(ctx, trayCommands)
+		defer tray.Close()
+	}
+
 	backoff := adminReconnectInitialBackoff
 	for {
 		client, err := adminapi.DialUnix(ctx, opts.SocketPath)
@@ -56,7 +64,7 @@ func run(ctx context.Context, opts options, notifications notifier) error {
 		}
 
 		backoff = adminReconnectInitialBackoff
-		err = runConnectedClient(ctx, client, notifications, opts)
+		err = runConnectedClient(ctx, client, notifications, opts, tray, trayCommands)
 		if closeErr := client.Close(); closeErr != nil && ctx.Err() == nil {
 			log.Printf("close admin API client: %s", closeErr)
 		}
@@ -80,10 +88,17 @@ func runClient(ctx context.Context, client *adminapi.Client, notifications notif
 			log.Printf("close desktop notifier: %s", err)
 		}
 	}()
-	return runConnectedClient(ctx, client, notifications, opts)
+	trayCommands := make(chan trayCommand, 8)
+	tray := trayController(noopTray{})
+	if opts.TrayEnabled {
+		tray = newSystemTray()
+		tray.Start(ctx, trayCommands)
+		defer tray.Close()
+	}
+	return runConnectedClient(ctx, client, notifications, opts, tray, trayCommands)
 }
 
-func runConnectedClient(ctx context.Context, client *adminapi.Client, notifications notifier, opts options) error {
+func runConnectedClient(ctx context.Context, client *adminapi.Client, notifications notifier, opts options, tray trayController, trayCommands <-chan trayCommand) error {
 	sessionCtx, cancelSession := context.WithCancel(ctx)
 	defer cancelSession()
 
@@ -97,14 +112,6 @@ func runConnectedClient(ctx context.Context, client *adminapi.Client, notificati
 	}
 	if err := client.RequestConfig(); err != nil {
 		return err
-	}
-
-	trayCommands := make(chan trayCommand, 8)
-	tray := trayController(noopTray{})
-	if opts.TrayEnabled {
-		tray = newSystemTray()
-		tray.Start(ctx, trayCommands)
-		defer tray.Close()
 	}
 
 	ctxDone := make(chan struct{})

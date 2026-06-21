@@ -9,11 +9,18 @@ import (
 	"log"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/asciimoth/killswitch/internal/adminapi"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/vishvananda/netlink"
+)
+
+const (
+	netlinkUpdateBufferSize  = 1024
+	netlinkReceiveBufferSize = 4 * 1024 * 1024
+	netlinkReconcileDelay    = 100 * time.Millisecond
 )
 
 func newEgressManager(program *ebpf.Program) *egressManager {
@@ -113,135 +120,138 @@ func (m *egressManager) close() {
 }
 
 func watchInterfaces(ctx context.Context, manager *egressManager, policies *policyManager, reconcileMu *sync.Mutex, notify func(adminapi.EventType)) error {
-	linkUpdates := make(chan netlink.LinkUpdate, 32)
-	addrUpdates := make(chan netlink.AddrUpdate, 32)
-	routeUpdates := make(chan netlink.RouteUpdate, 32)
-	neighUpdates := make(chan netlink.NeighUpdate, 32)
-	done := make(chan struct{})
-	defer close(done)
+	var linkUpdates chan netlink.LinkUpdate
+	var addrUpdates chan netlink.AddrUpdate
+	var routeUpdates chan netlink.RouteUpdate
+	var neighUpdates chan netlink.NeighUpdate
 
-	subscribeErrs := make(chan error, 1)
-	errCallback := func(err error) {
-		select {
-		case subscribeErrs <- err:
-		default:
-			log.Printf("ERROR: netlink link watcher: %s", err)
+	type subscriptionError struct {
+		generation int
+		err        error
+	}
+	subscribeErrs := make(chan subscriptionError, 1)
+
+	subscribe := func(done <-chan struct{}, generation int) error {
+		linkUpdates = make(chan netlink.LinkUpdate, netlinkUpdateBufferSize)
+		addrUpdates = make(chan netlink.AddrUpdate, netlinkUpdateBufferSize)
+		routeUpdates = make(chan netlink.RouteUpdate, netlinkUpdateBufferSize)
+		neighUpdates = make(chan netlink.NeighUpdate, netlinkUpdateBufferSize)
+		errCallback := func(err error) {
+			select {
+			case subscribeErrs <- subscriptionError{generation: generation, err: err}:
+			default:
+				log.Printf("ERROR: netlink watcher: %s", err)
+			}
 		}
+		if err := netlink.LinkSubscribeWithOptions(linkUpdates, done, netlink.LinkSubscribeOptions{
+			ErrorCallback:          errCallback,
+			ReceiveBufferSize:      netlinkReceiveBufferSize,
+			ReceiveBufferForceSize: true,
+		}); err != nil {
+			return fmt.Errorf("subscribe to netlink link updates: %w", err)
+		}
+		if err := netlink.AddrSubscribeWithOptions(addrUpdates, done, netlink.AddrSubscribeOptions{
+			ErrorCallback:          errCallback,
+			ReceiveBufferSize:      netlinkReceiveBufferSize,
+			ReceiveBufferForceSize: true,
+		}); err != nil {
+			return fmt.Errorf("subscribe to netlink addr updates: %w", err)
+		}
+		if err := netlink.RouteSubscribeWithOptions(routeUpdates, done, netlink.RouteSubscribeOptions{
+			ErrorCallback:          errCallback,
+			ReceiveBufferSize:      netlinkReceiveBufferSize,
+			ReceiveBufferForceSize: true,
+		}); err != nil {
+			return fmt.Errorf("subscribe to netlink route updates: %w", err)
+		}
+		if err := netlink.NeighSubscribeWithOptions(neighUpdates, done, netlink.NeighSubscribeOptions{
+			ErrorCallback:          errCallback,
+			ReceiveBufferSize:      netlinkReceiveBufferSize,
+			ReceiveBufferForceSize: true,
+		}); err != nil {
+			return fmt.Errorf("subscribe to netlink neighbor updates: %w", err)
+		}
+		return nil
 	}
 
-	if err := netlink.LinkSubscribeWithOptions(linkUpdates, done, netlink.LinkSubscribeOptions{
-		ErrorCallback: errCallback,
-	}); err != nil {
-		return fmt.Errorf("subscribe to netlink link updates: %w", err)
-	}
-	if err := netlink.AddrSubscribeWithOptions(addrUpdates, done, netlink.AddrSubscribeOptions{
-		ErrorCallback: errCallback,
-	}); err != nil {
-		return fmt.Errorf("subscribe to netlink addr updates: %w", err)
-	}
-	if err := netlink.RouteSubscribeWithOptions(routeUpdates, done, netlink.RouteSubscribeOptions{
-		ErrorCallback: errCallback,
-	}); err != nil {
-		return fmt.Errorf("subscribe to netlink route updates: %w", err)
-	}
-	if err := netlink.NeighSubscribeWithOptions(neighUpdates, done, netlink.NeighSubscribeOptions{
-		ErrorCallback: errCallback,
-	}); err != nil {
-		return fmt.Errorf("subscribe to netlink neighbor updates: %w", err)
+	reconcile := func(reason string, strict bool, notifyInterfaces bool) error {
+		reconcileMu.Lock()
+		interfacesChanged, ifaceErr := manager.reconcileCurrent(policies.optionsSnapshot(), strict)
+		if ifaceErr != nil {
+			log.Printf("ERROR: reconcile interfaces after %s: %s", reason, ifaceErr)
+		}
+		policyChanged, policyErr := policies.reconcileAttached(manager, true)
+		if policyErr != nil {
+			log.Printf("ERROR: reconcile rulesets after %s: %s", reason, policyErr)
+		}
+		reconcileMu.Unlock()
+		if notify != nil {
+			if notifyInterfaces || interfacesChanged {
+				notify(adminapi.EventTypeInterfaces)
+			}
+			if interfacesChanged || policyChanged {
+				notify(adminapi.EventTypeConfig)
+			}
+		}
+		if strict {
+			return errors.Join(ifaceErr, policyErr)
+		}
+		return nil
 	}
 
-	if _, err := manager.reconcileCurrent(policies.optionsSnapshot(), true); err != nil {
+	subscriptionDone := make(chan struct{})
+	defer close(subscriptionDone)
+	subscriptionGeneration := 1
+	if err := subscribe(subscriptionDone, subscriptionGeneration); err != nil {
 		return err
 	}
-	policyChanged, err := policies.reconcileAttached(manager, true)
-	if err != nil {
+	if err := reconcile("startup", true, true); err != nil {
 		return err
 	}
-	if notify != nil {
-		notify(adminapi.EventTypeInterfaces)
-		if policyChanged {
-			notify(adminapi.EventTypeConfig)
-		}
+
+	reconcileTimer := time.NewTimer(time.Hour)
+	if !reconcileTimer.Stop() {
+		<-reconcileTimer.C
+	}
+	defer reconcileTimer.Stop()
+	reconcilePending := false
+	notifyInterfaces := false
+	scheduleReconcile := func(interfaces bool) {
+		reconcilePending = true
+		notifyInterfaces = notifyInterfaces || interfaces
+		reconcileTimer.Reset(netlinkReconcileDelay)
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case err := <-subscribeErrs:
-			return fmt.Errorf("netlink watcher: %w", err)
+		case subErr := <-subscribeErrs:
+			if subErr.generation != subscriptionGeneration {
+				continue
+			}
+			log.Printf("ERROR: netlink watcher: %s; resubscribing", subErr.err)
+			close(subscriptionDone)
+			subscriptionDone = make(chan struct{})
+			subscriptionGeneration++
+			if err := subscribe(subscriptionDone, subscriptionGeneration); err != nil {
+				return fmt.Errorf("resubscribe to netlink updates: %w", err)
+			}
+			_ = reconcile("netlink resubscribe", false, true)
 		case <-linkUpdates:
-			reconcileMu.Lock()
-			opts := policies.optionsSnapshot()
-			interfacesChanged, err := manager.reconcileCurrent(opts, false)
-			if err != nil {
-				log.Printf("ERROR: reconcile interfaces after netlink link update: %s", err)
-			}
-			policyChanged, err := policies.reconcileAttached(manager, true)
-			if err != nil {
-				log.Printf("ERROR: reconcile rulesets after netlink link update: %s", err)
-			}
-			reconcileMu.Unlock()
-			if notify != nil {
-				notify(adminapi.EventTypeInterfaces)
-				if interfacesChanged || policyChanged {
-					notify(adminapi.EventTypeConfig)
-				}
-			}
+			scheduleReconcile(true)
 		case <-addrUpdates:
-			reconcileMu.Lock()
-			_, err := manager.reconcileCurrent(policies.optionsSnapshot(), false)
-			if err != nil {
-				log.Printf("ERROR: reconcile interfaces after netlink addr update: %s", err)
-			}
-			policyChanged, err := policies.reconcileAttached(manager, true)
-			if err != nil {
-				log.Printf("ERROR: reconcile rulesets after netlink addr update: %s", err)
-			}
-			reconcileMu.Unlock()
-			if notify != nil {
-				notify(adminapi.EventTypeInterfaces)
-				if policyChanged {
-					notify(adminapi.EventTypeConfig)
-				}
-			}
+			scheduleReconcile(true)
 		case <-routeUpdates:
-			reconcileMu.Lock()
-			interfacesChanged, err := manager.reconcileCurrent(policies.optionsSnapshot(), false)
-			if err != nil {
-				log.Printf("ERROR: reconcile interfaces after netlink route update: %s", err)
-			}
-			policyChanged, err := policies.reconcileAttached(manager, true)
-			if err != nil {
-				log.Printf("ERROR: reconcile rulesets after netlink route update: %s", err)
-			}
-			reconcileMu.Unlock()
-			if notify != nil {
-				if interfacesChanged {
-					notify(adminapi.EventTypeInterfaces)
-				}
-				if policyChanged {
-					notify(adminapi.EventTypeConfig)
-				}
-			}
+			scheduleReconcile(false)
 		case <-neighUpdates:
-			reconcileMu.Lock()
-			interfacesChanged, err := manager.reconcileCurrent(policies.optionsSnapshot(), false)
-			if err != nil {
-				log.Printf("ERROR: reconcile interfaces after netlink neighbor update: %s", err)
-			}
-			policyChanged, err := policies.reconcileAttached(manager, true)
-			if err != nil {
-				log.Printf("ERROR: reconcile rulesets after netlink neighbor update: %s", err)
-			}
-			reconcileMu.Unlock()
-			if notify != nil {
-				if interfacesChanged {
-					notify(adminapi.EventTypeInterfaces)
-				}
-				if policyChanged {
-					notify(adminapi.EventTypeConfig)
-				}
+			scheduleReconcile(false)
+		case <-reconcileTimer.C:
+			if reconcilePending {
+				interfaces := notifyInterfaces
+				reconcilePending = false
+				notifyInterfaces = false
+				_ = reconcile("netlink update", false, interfaces)
 			}
 		}
 	}
