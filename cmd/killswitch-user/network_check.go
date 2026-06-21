@@ -180,12 +180,15 @@ func runNetworkCheck(ctx context.Context, opts networkCheckOptions, cfg adminapi
 	// }
 	// resp, err := client.Do(req)
 
-	resp, req, err := DoRequestWithRetries(ctx, client, opts.URL)
+	resp, req, cleanup, err := DoRequestWithRetries(ctx, client, opts.URL)
 
 	if err != nil {
 		return networkCheckResult{Reason: reason, Status: networkCheckStatusNoInternet, Proxy: proxy, Detail: err.Error(), SocksProxyHost: socksProxyHost, SocksProxyPort: socksProxyPort, SocksProxyAddr: socksProxyAddr}
 	}
-	defer resp.Body.Close() //nolint:errcheck
+	defer func() {
+		_ = resp.Body.Close()
+		cleanup()
+	}()
 
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		return networkCheckResult{
@@ -435,7 +438,7 @@ func DoRequestWithRetries(
 	ctx context.Context,
 	client *http.Client,
 	url string,
-) (*http.Response, *http.Request, error) {
+) (*http.Response, *http.Request, func(), error) {
 	timeouts := []time.Duration{
 		1 * time.Second, 2 * time.Second, 10 * time.Second,
 	}
@@ -451,15 +454,15 @@ func DoRequestWithRetries(
 		lastReq = req
 		if err != nil {
 			cancel()
-			return nil, req, err
+			return nil, req, nil, err
 		}
 
 		resp, err := client.Do(req)
-		cancel()
 
 		if err == nil {
-			return resp, req, nil
+			return resp, req, cancel, nil
 		}
+		cancel()
 
 		lastErr = err
 
@@ -467,7 +470,7 @@ func DoRequestWithRetries(
 			continue
 		}
 
-		return nil, req, err
+		return nil, req, nil, err
 	}
-	return nil, lastReq, lastErr
+	return nil, lastReq, nil, lastErr
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -331,6 +332,49 @@ func TestRunNetworkCheckClassifiesUnexpectedResponseAsLoginRequired(t *testing.T
 	}, adminapi.CurrentConfig{}, "test")
 	if result.Status != networkCheckStatusLoginRequired {
 		t.Fatalf("status = %s, detail = %s", result.Status, result.Detail)
+	}
+}
+
+func TestDoRequestWithRetriesKeepsContextUntilResponseBodyClosed(t *testing.T) {
+	body := "online"
+	client := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: &contextCheckingBody{
+					ctx:    req.Context(),
+					reader: strings.NewReader(body),
+				},
+				Request: req,
+			}, nil
+		}),
+	}
+
+	resp, req, cleanup, err := DoRequestWithRetries(context.Background(), client, "http://example.test/")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("cleanup is nil")
+	}
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("body = %q, want %q", string(got), body)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close body: %v", err)
+	}
+	cleanup()
+
+	select {
+	case <-req.Context().Done():
+	default:
+		t.Fatal("request context was not cancelled by cleanup")
 	}
 }
 
@@ -800,6 +844,30 @@ func TestNotificationTitle(t *testing.T) {
 			}
 		})
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type contextCheckingBody struct {
+	ctx    context.Context
+	reader *strings.Reader
+}
+
+func (b *contextCheckingBody) Read(p []byte) (int, error) {
+	select {
+	case <-b.ctx.Done():
+		return 0, b.ctx.Err()
+	default:
+		return b.reader.Read(p)
+	}
+}
+
+func (b *contextCheckingBody) Close() error {
+	return nil
 }
 
 type recordingNotifier struct {
