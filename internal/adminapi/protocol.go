@@ -2,6 +2,7 @@ package adminapi
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -387,5 +388,5 @@ func decodePayload(payload json.RawMessage, dst any) error {
 }
 
 func IsEOF(err error) bool {
-	return err == io.EOF
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }

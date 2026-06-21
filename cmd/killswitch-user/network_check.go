@@ -24,6 +24,7 @@ import (
 )
 
 const networkCheckStatusHeader = "X-NetworkManager-Status"
+const networkCheckQueueSize = 10
 
 type networkCheckStatus string
 
@@ -44,9 +45,14 @@ type networkCheckResult struct {
 	SocksProxyAddr string
 }
 
+type networkCheckRequest struct {
+	cfg    adminapi.CurrentConfig
+	reason string
+}
+
 type networkCheckWatcher struct {
 	opts                   networkCheckOptions
-	running                bool
+	requests               chan networkCheckRequest
 	lastStatus             networkCheckStatus
 	haveStatus             bool
 	lastInterfacesSnapshot string
@@ -54,7 +60,7 @@ type networkCheckWatcher struct {
 }
 
 func newNetworkCheckWatcher(opts networkCheckOptions) *networkCheckWatcher {
-	return &networkCheckWatcher{opts: opts}
+	return &networkCheckWatcher{opts: opts, requests: make(chan networkCheckRequest, networkCheckQueueSize)}
 }
 
 func (w *networkCheckWatcher) applyInitial(cfg adminapi.CurrentConfig) {
@@ -79,23 +85,36 @@ func (w *networkCheckWatcher) check(ctx context.Context, cfg adminapi.CurrentCon
 	if !w.opts.Enabled {
 		return
 	}
-	if w.running {
-		log.Printf("Network check skipped (%s): previous check is still running", reason)
+	select {
+	case w.requests <- networkCheckRequest{cfg: cfg, reason: reason}:
+	default:
+		log.Printf("Network check skipped (%s): check queue is full", reason)
+	}
+}
+
+func (w *networkCheckWatcher) start(ctx context.Context, results chan<- networkCheckResult) {
+	if !w.opts.Enabled {
 		return
 	}
-	w.running = true
-	log.Printf("Network check started (%s): url=%s", reason, w.opts.URL)
 	go func() {
-		result := runNetworkCheck(ctx, w.opts, cfg, reason)
-		select {
-		case results <- result:
-		case <-ctx.Done():
+		for {
+			select {
+			case req := <-w.requests:
+				log.Printf("Network check started (%s): url=%s", req.reason, w.opts.URL)
+				result := runNetworkCheck(ctx, w.opts, req.cfg, req.reason)
+				select {
+				case results <- result:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 }
 
 func (w *networkCheckWatcher) finish(ctx context.Context, notifications notifier, tray trayController, result networkCheckResult) {
-	w.running = false
 	if result.PortalURL != "" {
 		log.Printf("Network check finished (%s): status=%s proxy=%s portal=%s detail=%s", result.Reason, result.Status, result.Proxy, result.PortalURL, result.Detail)
 	} else {

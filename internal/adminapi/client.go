@@ -3,7 +3,6 @@ package adminapi
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 )
@@ -63,7 +62,7 @@ func (c *Client) WaitForConfig() (CurrentConfig, error) {
 		msg, err := c.Receive()
 		if err != nil {
 			if IsEOF(err) {
-				return CurrentConfig{}, errors.New("connection closed before config was received")
+				return CurrentConfig{}, fmt.Errorf("connection closed before config was received: %w", err)
 			}
 			return CurrentConfig{}, fmt.Errorf("read admin API message: %w", err)
 		}
@@ -78,7 +77,7 @@ func (c *Client) WaitForEvent() (EventMessage, error) {
 		msg, err := c.Receive()
 		if err != nil {
 			if IsEOF(err) {
-				return EventMessage{}, errors.New("connection closed before event was received")
+				return EventMessage{}, fmt.Errorf("connection closed before event was received: %w", err)
 			}
 			return EventMessage{}, fmt.Errorf("read admin API message: %w", err)
 		}
@@ -112,7 +111,7 @@ func (c *Client) WaitForMutationResult() (MutationResult, error) {
 		msg, err := c.Receive()
 		if err != nil {
 			if IsEOF(err) {
-				return MutationResult{}, errors.New("connection closed before mutation result was received")
+				return MutationResult{}, fmt.Errorf("connection closed before mutation result was received: %w", err)
 			}
 			return MutationResult{}, fmt.Errorf("read admin API message: %w", err)
 		}
@@ -134,7 +133,7 @@ func (c *Client) WaitForDebugResult() (DebugResult, error) {
 		msg, err := c.Receive()
 		if err != nil {
 			if IsEOF(err) {
-				return DebugResult{}, errors.New("connection closed before debug result was received")
+				return DebugResult{}, fmt.Errorf("connection closed before debug result was received: %w", err)
 			}
 			return DebugResult{}, fmt.Errorf("read admin API message: %w", err)
 		}

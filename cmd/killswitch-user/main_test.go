@@ -594,6 +594,106 @@ func TestRunClientSubscribesAllEventsAndNotifies(t *testing.T) {
 	}
 }
 
+func TestRunReconnectsAfterAdminEOF(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "admin.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close() //nolint:errcheck
+
+	ctx, cancel := context.WithCancel(context.Background())
+	notifications := &recordingNotifier{cancel: cancel}
+	serverErr := make(chan error, 1)
+	go func() {
+		defer listener.Close() //nolint:errcheck
+		for i := 0; i < 2; i++ {
+			conn, err := listener.Accept()
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			decoder := json.NewDecoder(conn)
+			if msg, err := adminapi.ReadMessage(decoder); err != nil {
+				_ = conn.Close()
+				serverErr <- err
+				return
+			} else if _, ok := msg.(adminapi.SubscribeRequest); !ok {
+				_ = conn.Close()
+				serverErr <- errors.New("first message was not subscribe")
+				return
+			}
+			if msg, err := adminapi.ReadMessage(decoder); err != nil {
+				_ = conn.Close()
+				serverErr <- err
+				return
+			} else if _, ok := msg.(adminapi.ConfigRequest); !ok {
+				_ = conn.Close()
+				serverErr <- errors.New("second message was not config request")
+				return
+			}
+
+			encoder := json.NewEncoder(conn)
+			if err := adminapi.WriteMessage(encoder, adminapi.ConfigMessage{}); err != nil {
+				_ = conn.Close()
+				serverErr <- err
+				return
+			}
+			if i == 0 {
+				_ = conn.Close()
+				continue
+			}
+			if err := adminapi.WriteMessage(encoder, adminapi.EventMessage{
+				EventType: adminapi.EventTypeNotification,
+				Notification: adminapi.Notification{
+					Header: "Reconnected",
+					Text:   "admin API events resumed",
+				},
+			}); err != nil {
+				_ = conn.Close()
+				serverErr <- err
+				return
+			}
+			_ = conn.Close()
+		}
+		serverErr <- nil
+	}()
+
+	if err := run(ctx, options{SocketPath: socketPath}, notifications); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	if len(notifications.notifications) != 1 || notifications.notifications[0].Header != "Reconnected" {
+		t.Fatalf("notifications = %+v", notifications.notifications)
+	}
+	if !notifications.closed {
+		t.Fatal("notifier was not closed")
+	}
+}
+
+func TestNetworkCheckSchedulingDropsWhenQueueFull(t *testing.T) {
+	watcher := newNetworkCheckWatcher(networkCheckOptions{
+		Enabled: true,
+		URL:     "http://example.test/",
+	})
+	for i := 0; i < networkCheckQueueSize; i++ {
+		watcher.check(context.Background(), adminapi.CurrentConfig{}, nil, "interfaces")
+	}
+	watcher.check(context.Background(), adminapi.CurrentConfig{}, nil, "config")
+
+	if got := len(watcher.requests); got != networkCheckQueueSize {
+		t.Fatalf("queued checks = %d, want %d", got, networkCheckQueueSize)
+	}
+	for i := 0; i < networkCheckQueueSize; i++ {
+		req := <-watcher.requests
+		if req.reason != "interfaces" {
+			t.Fatalf("queued reason = %q, want interfaces", req.reason)
+		}
+	}
+}
+
 func TestConfigNotificationWatcherNotifiesOnlyInterfaceAppearGone(t *testing.T) {
 	notifications := &recordingNotifier{}
 	watcher := configNotificationWatcher{notifyInterfaceChanges: true, notifyGlobalAllowAll: true}

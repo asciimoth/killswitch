@@ -3,10 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
+	"net"
+	"strings"
 	"time"
 
 	"github.com/asciimoth/killswitch/internal/adminapi"
+)
+
+const (
+	adminReconnectInitialBackoff = 200 * time.Millisecond
+	adminReconnectMaxBackoff     = 10 * time.Second
 )
 
 type notifier interface {
@@ -26,13 +34,44 @@ type trayController interface {
 }
 
 func run(ctx context.Context, opts options, notifications notifier) error {
-	client, err := adminapi.DialUnix(ctx, opts.SocketPath)
-	if err != nil {
-		return err
-	}
-	defer client.Close() //nolint:errcheck
+	defer func() {
+		if err := notifications.Close(); err != nil {
+			log.Printf("close desktop notifier: %s", err)
+		}
+	}()
 
-	return runClient(ctx, client, notifications, opts)
+	backoff := adminReconnectInitialBackoff
+	for {
+		client, err := adminapi.DialUnix(ctx, opts.SocketPath)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			log.Printf("connect to admin API failed: %s; retrying in %s", err, backoff)
+			if !sleepContext(ctx, backoff) {
+				return nil
+			}
+			backoff = nextAdminReconnectBackoff(backoff)
+			continue
+		}
+
+		backoff = adminReconnectInitialBackoff
+		err = runConnectedClient(ctx, client, notifications, opts)
+		if closeErr := client.Close(); closeErr != nil && ctx.Err() == nil {
+			log.Printf("close admin API client: %s", closeErr)
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !isReconnectableAdminError(err) {
+			return err
+		}
+		log.Printf("admin API disconnected: %s; reconnecting in %s", err, backoff)
+		if !sleepContext(ctx, backoff) {
+			return nil
+		}
+		backoff = nextAdminReconnectBackoff(backoff)
+	}
 }
 
 func runClient(ctx context.Context, client *adminapi.Client, notifications notifier, opts options) error {
@@ -41,6 +80,12 @@ func runClient(ctx context.Context, client *adminapi.Client, notifications notif
 			log.Printf("close desktop notifier: %s", err)
 		}
 	}()
+	return runConnectedClient(ctx, client, notifications, opts)
+}
+
+func runConnectedClient(ctx context.Context, client *adminapi.Client, notifications notifier, opts options) error {
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	defer cancelSession()
 
 	if err := client.Subscribe(
 		adminapi.EventTypeConfig,
@@ -105,6 +150,7 @@ func runClient(ctx context.Context, client *adminapi.Client, notifications notif
 	mutationResults := make(chan adminapi.MutationResult, 1)
 	networkCheckResults := make(chan networkCheckResult, 1)
 	errs := make(chan error, 1)
+	networkChecks.start(sessionCtx, networkCheckResults)
 	go func() {
 		for {
 			msg, err := client.Receive()
@@ -120,7 +166,7 @@ func runClient(ctx context.Context, client *adminapi.Client, notifications notif
 			}
 		}
 	}()
-	networkChecks.check(ctx, latestConfig, networkCheckResults, "start")
+	networkChecks.check(sessionCtx, latestConfig, networkCheckResults, "start")
 
 	for {
 		select {
@@ -130,7 +176,7 @@ func runClient(ctx context.Context, client *adminapi.Client, notifications notif
 			}
 		case cmd := <-trayCommands:
 			if cmd.Kind == trayCommandOpenCaptivePortal {
-				networkChecks.openLastCaptivePortal(ctx, notifications)
+				networkChecks.openLastCaptivePortal(sessionCtx, notifications)
 				continue
 			}
 			if err := applyTrayCommand(client, cmd); err != nil {
@@ -144,11 +190,11 @@ func runClient(ctx context.Context, client *adminapi.Client, notifications notif
 			watcher.update(notifications, result.Config)
 			tray.Update(result.Config)
 			latestConfig = result.Config
-			networkChecks.checkIfInterfacesChanged(ctx, latestConfig, networkCheckResults, "mutation")
+			networkChecks.checkIfInterfacesChanged(sessionCtx, latestConfig, networkCheckResults, "mutation")
 		case result := <-networkCheckResults:
-			networkChecks.finish(ctx, notifications, tray, result)
+			networkChecks.finish(sessionCtx, notifications, tray, result)
 		case <-networkCheckTimer:
-			networkChecks.check(ctx, latestConfig, networkCheckResults, "periodic")
+			networkChecks.check(sessionCtx, latestConfig, networkCheckResults, "periodic")
 		case err := <-errs:
 			if ctx.Err() != nil {
 				return nil
@@ -164,17 +210,49 @@ func runClient(ctx context.Context, client *adminapi.Client, notifications notif
 				watcher.update(notifications, event.Config)
 				tray.Update(event.Config)
 				latestConfig = event.Config
-				networkChecks.checkIfInterfacesChanged(ctx, latestConfig, networkCheckResults, "config")
+				networkChecks.checkIfInterfacesChanged(sessionCtx, latestConfig, networkCheckResults, "config")
 			case adminapi.EventTypeInterfaces, adminapi.EventTypeClients:
 				tray.Update(event.Config)
 				latestConfig = event.Config
 				if event.EventType == adminapi.EventTypeInterfaces {
-					networkChecks.checkInterfacesEvent(ctx, latestConfig, networkCheckResults)
+					networkChecks.checkInterfacesEvent(sessionCtx, latestConfig, networkCheckResults)
 				}
 			default:
 				continue
 			}
 		}
+	}
+}
+
+func isReconnectableAdminError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if adminapi.IsEOF(err) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	message := err.Error()
+	return strings.Contains(message, "connection reset by peer") ||
+		strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "use of closed network connection")
+}
+
+func nextAdminReconnectBackoff(backoff time.Duration) time.Duration {
+	backoff *= 2
+	if backoff > adminReconnectMaxBackoff {
+		return adminReconnectMaxBackoff
+	}
+	return backoff
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
